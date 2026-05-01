@@ -1,234 +1,120 @@
-[![PyPI](https://img.shields.io/pypi/v/deface)](https://pypi.org/project/deface/) [![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ORB-HD/deface/python-publish.yml)](https://github.com/ORB-HD/deface/actions)
+# deface · docx 人脸打码 GUI
 
-# `deface`: Video anonymization by face detection
+> 这个仓库 fork 自 [ORB-HD/deface](https://github.com/ORB-HD/deface) — 在原版 CLI 基础上**新增了一个面向 Word 文档的 PySide6 桌面 GUI**,用 YuNet 检测人脸并把高斯模糊回写到 `.docx` 里,常用于活动合影、汇报材料的整稿匿名化。原版 deface 的视频/图片 CLI 仍然可用,见下文「上游 CLI」一节。
 
-`deface` is a simple command-line tool for automatic anonymization of faces in videos or photos.
-It works by first detecting all human faces in each video frame and then applying an anonymization filter (blurring or black boxes) on each detected face region.
-By default all audio tracks are discarded as well.
+## ✨ 主要功能
 
+- **导入 `.docx` → 自动提取所有图片**(`word/media/*`、`word/embeddings/*`)
+- **YuNet 检测人脸**(OpenCV 4.6+ 内置,比原版 CenterFace 准且不会因大图溢出)
+- **逐张人工审核**:
+  - 🔴 红框 = 会被高斯模糊
+  - 🟢 绿框 = 保留(误判时点掉它)
+  - 左键点框切换、右键删框
+  - **手动加框**:漏检的脸自己拖矩形补
+- **阈值滑块** 350ms 防抖,自动对当前图重检测,旧的红/绿状态用 IoU 自动复用
+- **Up/Down(或 J/K)切换图片**,无论焦点在哪都生效
+- **导出新 `.docx`**:只替换有打码的图片,document.xml / 关系 / 样式按字节透传,Word 100% 能正常打开
+- **解码用 PIL `convert("RGB")`**:CMYK / RGBA / 调色板 PNG 不会再反色
+- **编码按扩展名强制 mode**:`.jpg/.bmp/.gif` 强制 RGB(去 alpha)、`.png/.tif/.webp` 透传 alpha,JPEG 不会再因 alpha 崩
 
-Original frame | `deface` output (using default options)
-:--:|:--:
-![examples/city.jpg](examples/city.jpg) | ![$ deface examples/city.jpg](examples/city_anonymized.jpg)
+## 📷 界面预览
 
+> 占位 — 第一次使用截图后请把 PNG 放到 `docs/` 下并替换以下链接:
 
-## Installation
+| 选图与审核 | 手动加框 |
+|---|---|
+| `docs/screenshot-review.png` | `docs/screenshot-manual.png` |
 
-`deface` supports all commonly used operating systems (Linux, Windows, MacOS), but it requires using a command-line shell such as bash. There are currently no plans of creating a graphical user interface.
+## 🚀 安装
 
-The recommended way of installing `deface` is via the `pip` package manager. This requires that you have Python 3.6 or later installed on your system. It is recommended to set up and activate a new [virtual environment](https://realpython.com/python-virtual-environments-a-primer/) first. Then you can install the latest release of `deface` and all necessary dependencies by running:
+需要 **Python 3.10+**(测试在 3.14 上)。建议先建 venv:
 
-    $ python3 -m pip install deface
+```bash
+git clone https://github.com/ChaosJulien/deface.git
+cd deface
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-Alternatively, if you want to use the latest (unreleased) revision directly from GitHub, you can run:
-
-    $ python3 -m pip install 'git+https://github.com/ORB-HD/deface'
-
-This will only install the dependencies that are strictly required for running the tool. If you want to speed up processing by enabling hardware acceleration, you will need to manually install additional packages, see [Hardware acceleration](#hardware-acceleration)
-
-
-## Usage
-
-### Quick start
-
-If you want to try out anonymizing a video using the default settings, you just need to supply the path to it. For example, if the path to your test video is `myvideos/vid1.mp4`, run:
-
-    $ deface myvideos/vid1.mp4
-
-This will write the the output to the new video file `myvideos/vid1_anonymized.mp4`.
-
-### Live capture demo
-
-If you have a camera (webcam) attached to your computer, you can run `deface` on the live video input by calling it with the `cam` argument instead of an input path:
-
-    $ deface cam
-
-This is a shortcut for `$ deface --preview '<video0>'`, where `'<video0>'` (literal) is a  camera device identifier. If you have multiple cameras installed, you can try `'<videoN>'`, where `N` is the index of the camera (see [imageio-ffmpeg docs](https://imageio.readthedocs.io/en/stable/format_ffmpeg.html)).
-
-### CLI usage and options summary
-
-To get an overview of usage and available options, run:
-
-    $ deface -h
-
-The output may vary depending on your installed version, but it should look similar to this:
-
-```
-usage: deface [--output O] [--thresh T] [--scale WxH] [--preview] [--boxes]
-              [--draw-scores] [--mask-scale M]
-              [--replacewith {blur,solid,none,img,mosaic}]
-              [--replaceimg REPLACEIMG] [--mosaicsize width] [--keep-audio]
-              [--ffmpeg-config FFMPEG_CONFIG] [--backend {auto,onnxrt,opencv}]
-              [--execution-provider EP] [--version] [--help]
-              [input ...]
-
-Video anonymization by face detection
-
-positional arguments:
-  input                 File path(s) or camera device name. It is possible to
-                        pass multiple paths by separating them by spaces or by
-                        using shell expansion (e.g. `$ deface vids/*.mp4`).
-                        Alternatively, you can pass a directory as an input,
-                        in which case all files in the directory will be used
-                        as inputs. If a camera is installed, a live webcam
-                        demo can be started by running `$ deface cam` (which
-                        is a shortcut for `$ deface -p '<video0>'`.
-
-optional arguments:
-  --output O, -o O      Output file name. Defaults to input path + postfix
-                        "_anonymized".
-  --thresh T, -t T      Detection threshold (tune this to trade off between
-                        false positive and false negative rate). Default: 0.2.
-  --scale WxH, -s WxH   Downscale images for network inference to this size
-                        (format: WxH, example: --scale 640x360).
-  --preview, -p         Enable live preview GUI (can decrease performance).
-  --boxes               Use boxes instead of ellipse masks.
-  --draw-scores         Draw detection scores onto outputs.
-  --disable-progress-output
-                        Disable video progress output to console.
-  --mask-scale M        Scale factor for face masks, to make sure that masks
-                        cover the complete face. Default: 1.3.
-  --replacewith {blur,solid,none,img,mosaic}
-                        Anonymization filter mode for face regions. "blur"
-                        applies a strong gaussian blurring, "solid" draws a
-                        solid black box, "none" does leaves the input
-                        unchanged, "img" replaces the face with a custom image
-                        and "mosaic" replaces the face with mosaic. Default:
-                        "blur".
-  --replaceimg REPLACEIMG
-                        Anonymization image for face regions. Requires
-                        --replacewith img option.
-  --mosaicsize width    Setting the mosaic size. Requires --replacewith mosaic
-                        option. Default: 20.
-  --keep-audio, -k      Keep audio from video source file and copy it over to
-                        the output (only applies to videos).
-  --ffmpeg-config FFMPEG_CONFIG
-                        FFMPEG config arguments for encoding output videos.
-                        This argument is expected in JSON notation. For a list
-                        of possible options, refer to the ffmpeg-imageio docs.
-                        Default: '{"codec": "libx264"}'.
-  --backend {auto,onnxrt,opencv}
-                        Backend for ONNX model execution. Default: "auto"
-                        (prefer onnxrt if available).
-  --execution-provider EP, --ep EP
-                        Override onnxrt execution provider (see
-                        https://onnxruntime.ai/docs/execution-providers/). If
-                        not specified, the presumably fastest available one
-                        will be automatically selected. Only used if backend is
-                        onnxrt.
-  --version             Print version number and exit.
-  --help, -h            Show this help message and exit.
+pip install -e .
+pip install PySide6 onnxruntime imageio Pillow
 ```
 
-## Usage examples
+YuNet 模型 (`face_detection_yunet_2023mar.onnx`, 228 KB) 已随仓库一起提交,无需额外下载。
 
-In most use cases the default configuration should be sufficient, but depending on individual requirements and type of media to be processed, some of the options might need to be adjusted. In this section, some common example scenarios that require option changes are presented. All of the examples use the photo [examples/city.jpg](examples/city.jpg), but they work the same on any video or photo file.
+## 🖱 使用 docx GUI
 
-### Drawing black boxes
+```bash
+python -m deface.docx_gui
+```
 
-By default, each detected face is anonymized by applying a blur filter to an ellipse region that covers the face. If you prefer to anonymize faces by drawing black boxes on top of them, you can achieve this through the `--boxes` and `--replacewith` options:
+操作流程:
 
-    $ deface examples/city.jpg --boxes --replacewith solid -o examples/city_anonymized_boxes.jpg
+1. 工具栏 **「打开 docx」** → 选 `.docx` 文件
+2. 后台并行检测所有图片,左侧列表显示进度 `打码 N / 总数`
+3. 在中央画布上审核每一张:
+   - **左键** 框 = 切换 红 / 绿(打码 / 保留)
+   - **右键** 框 = 删除(无论是误判还是手动加的)
+   - **Cmd+滚轮 / Ctrl+滚轮** = 缩放;不缩放时鼠标可拖动平移
+4. 漏检的脸 → 右侧 **「✏️ 手动加框」**,鼠标拖矩形,松手生成红框(`manual=True`)。手动框在重新检测时**不会被覆盖**
+5. 误判太多 / 漏检太多 → 调右侧 **检测阈值**(0.3 ~ 0.7),350 ms 防抖后自动对当前图重检测
+6. 工具栏 **「导出 docx」** → 默认存成 `<原文件名>_anonymized.docx`
 
-<img src="examples/city_anonymized_boxes.jpg" width="70%" alt="$ deface examples/city.jpg --enable-boxes --replacewith solid -o examples/city_anonymized_boxes.jpg"/>
+### ⌨️ 快捷键
 
-### Mosaic anonymization
+| 键 | 作用 |
+|---|---|
+| `↑` / `K` | 上一张图 |
+| `↓` / `J` | 下一张图 |
+| `Cmd / Ctrl + 滚轮` | 缩放当前图 |
+| 鼠标左键拖 | 平移图(非手动模式)|
 
-Another common anonymization option is to draw a mosaic pattern over faces. This is supported with the `--replacewith mosaic` option. The width of each of the quadratic mosaic fragments can be determined using the `--mosaicsize` option (default value: 20). Note that the mosaic size is measured in pixels, so you should consider increasing the size when processing higher-resolution inputs.
+### ⚙️ 参数说明
 
-Usage example:
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| 打码方式 | `blur` | 高斯模糊;另可选 `solid`(实心黑)、`mosaic`(马赛克)、`none`(只画框,不打码) |
+| 遮罩外扩 | `1.30` | 外扩 30% 把头发/下巴吃进去,防止边缘漏 |
+| 马赛克尺寸 | `20` | 仅 mosaic 模式生效 |
+| 检测阈值 | `0.50` | YuNet score 阈值,越高越严(漏检多但误判少)|
 
-    $ deface examples/city.jpg --replacewith mosaic --mosaicsize 20 -o examples/city_anonymized_mosaic.jpg
+### 🛡 设计上保证不破坏原文件
 
-<img src="examples/city_anonymized_mosaic.jpg" width="70%" alt="$ deface examples/city.jpg --replacewith mosaic --mosaicsize 20 -o examples/city_anonymized_mosaic.jpg"/>
+- 原 `.docx` 永远不动,导出是新文件
+- 没勾打码、没检出脸、所有框都是绿框的图片 → **原图字节透传**(`zin.read → zout.writestr`),不会被重新编码导致质量下降
+- 检测时大图缩到长边 1280 加速,但**打码画在原图全分辨率上**,导出图清晰度 = 原图清晰度
 
+## 🔬 工作原理
 
+1. **解析 docx**:zip 解压,`word/media/*`、`word/embeddings/*` 下的 `.png/.jpg/.jpeg/.bmp/.gif/.tif/.webp` 全部抽出
+2. **解码归一**:PIL `Image.open + convert("RGB")` 把 CMYK / RGBA / 调色板 / 灰度统一成 3 通道 RGB,杜绝反色
+3. **检测**:YuNet (`cv2.FaceDetectorYN`) 在 BGR 上跑,大图先 `cv2.resize` 到长边 1280,框结果 ×inv 放回原坐标
+4. **打码**:沿用原版 deface 的 `draw_det` 函数(椭圆遮罩 + 高斯/马赛克/实心)
+5. **回写**:用 `zipfile` 重打包,只对修改过的图片走 `zout.writestr`,其余条目按 `ZipInfo` 字节级透传
 
-### Tuning detection thresholds
+## 🖥 上游 CLI(原版功能)
 
-The detection threshold (`--thresh`, `-t`) is used to define how confident the detector needs to be for classifying some region as a face. By default this is set to the value 0.2, which was found to work well on many test videos.
+原版 `deface` 仍然可用,适合视频或一堆散图的批量处理:
 
-If you are experiencing too many false positives (i.e. anonymization filters applied at non-face regions) on your own video data, consider increasing the threshold.
-On the other hand, if there are too many false negative errors (visible faces that are not anonymized), lowering the threshold is advisable.
+```bash
+# 视频
+deface myvideo.mp4
 
-The optimal value can depend on many factors such as video quality, lighting conditions and prevalence of partial occlusions. To optimize this value, you can set threshold to a very low value and then draw detection score overlays, as described in the [section below](#drawing-detection-score-overlays).
+# 图片(支持通配符)
+deface 'photos/*.jpg'
 
-To demonstrate the effects of a threshold that is set too low or too high, see the examples outputs below:
+# 调阈值 + 改打码方式
+deface input.mp4 --thresh 0.5 --replacewith mosaic --mosaicsize 30
+```
 
-`--thresh 0.02` (notice the false positives, e.g. at hand regions) | `--thresh 0.7` (notice the false negatives, especially at partially occluded faces)
-:--:|:--:
-![examples/city_anonymized_thresh0.02.jpg](examples/city_anonymized_thresh0.02.jpg) | ![$ deface examples/city_anonymized_thresh0.7.jpg](examples/city_anonymized_thresh0.7.jpg)
+完整选项详见原仓库 README:[ORB-HD/deface](https://github.com/ORB-HD/deface#cli-usage-and-options-summary)。
 
+## 🙏 致谢
 
-### Drawing detection score overlays
+- 上游项目:[ORB-HD/deface](https://github.com/ORB-HD/deface) (MIT)
+- CenterFace 模型(原版 CLI 用):[Star-Clouds/centerface](https://github.com/Star-Clouds/centerface) (MIT)
+- YuNet 模型(本 GUI 用):[opencv/opencv_zoo - face_detection_yunet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) (MIT)
+- 训练数据集:[WIDER FACE](http://shuoyang1213.me/WIDERFACE/)
 
-If you are interested in seeing the faceness score (a score between 0 and 1 that roughly corresponds to the detector's confidence that something *is* a face) of each detected face in the input, you can enable the `--draw-scores` option to draw the score of each detection directly above its location.
+## 📄 License
 
-    $ deface examples/city.jpg --draw-scores -o examples/city_anonymized_scores.jpg
-
-<img src="examples/city_anonymized_scores.jpg" width="70%" alt="$ deface examples/city.jpg --draw-scores -o examples/city_anonymized_scores.jpg"/>
-
-This option can be useful to figure out an optimal value for the detection threshold that can then be set through the `--thresh` option.
-
-
-### High-resolution media and performance issues
-
-Since `deface` tries to detect faces in the unscaled full-res version of input files by default, this can lead to performance issues on high-res inputs (>> 720p). In extreme cases, even detection accuracy can suffer because the detector neural network has not been trained on ultra-high-res images.
-
-To counter these performance issues, `deface` supports downsampling its inputs on-the-fly before detecting faces, and subsequently rescaling detection results to the original resolution. Downsampling only applies to the detection process, whereas the final output resolution remains the same as the input resolution.
-
-This feature is controlled through the `--scale` option, which expects a value of the form `WxH`, where `W` and `H` are the desired width and height of downscaled input representations.
-It is very important to make sure the aspect ratio of the inputs remains intact when using this option, because otherwise, distorted images are fed into the detector, resulting in decreased accuracy.
-
-For example, if your inputs have the common aspect ratio 16:9, you can instruct the detector to run in 360p resolution by specifying `--scale 640x360`.
-If the results at this fairly low resolution are not good enough, detection at 720p input resolution (`--scale 1280x720`) may work better.
-
-
-## Hardware acceleration
-
-Depending on your available hardware, you can speed up neural network inference by enabling the optional [ONNX Runtime](https://microsoft.github.io/onnxruntime/) backend of `deface`. For optimal performance you should install it with appropriate [Execution Providers](https://onnxruntime.ai/docs/execution-providers) for your system. If you have multiple Execution Providers installed, ONNX Runtime will try to automatically use the fastest one available.
-
-Here are some recommendations for common setups:
-
-### CUDA (only for Nvidia GPUs)
-
-If you have a CUDA-capable GPU, you can enable GPU acceleration by installing the relevant packages:
-
-    $ python3 -m pip install onnx onnxruntime-gpu
-
-If the `onnxruntime-gpu` package is found and a GPU is available, the face detection network is automatically offloaded to the GPU.
-This can significantly improve the overall processing speed.
-
-### DirectML (only for Windows)
-
-Windows users with capable non-Nvidia GPUs can enable GPU-accelerated inference with DirectML by installing:
-
-    $ python3 -m pip install onnx onnxruntime-directml
-
-### OpenVINO
-
-OpenVINO can accelerate inference even on CPU-only systems by a few percent, compared to the default OpenCV and ONNX Runtime implementations. It works on Linux and Windows, but not yet on Python 3.11 as of July 2023. Install the backend with:
-
-    $ python3 -m pip install onnx onnxruntime-openvino
-
-
-### Other platforms
-
-If you your setup doesn't fit with these recommendations, look into the available options at the [Execution Provider](https://onnxruntime.ai/docs/execution-providers/#summary-of-supported-execution-providers) documentation and find the respective installation instructions in the [ONNX Runtime build matrix](https://microsoft.github.io/onnxruntime/).
-
-
-## How it works
-
-The included face detection system is based on CenterFace ([code](https://github.com/Star-Clouds/centerface), [paper](https://arxiv.org/abs/1911.03599)), a deep neural network optimized for fast but reliable detection of human faces in photos.
-The network was trained on the [WIDER FACE](http://shuoyang1213.me/WIDERFACE/) dataset, which contains annotated photos showing faces in a wide variety of scales, poses and occlusions.
-
-Although the face detector is originally intended to be used for normal 2D images, `deface` can also use it to detect faces in video data by analyzing each video frame independently.
-The face bounding boxes predicted by the CenterFace detector are then used as masks to determine where to apply anonymization filters.
-
-
-## Credits
-
-- `centerface.py` is based on https://github.com/Star-Clouds/centerface (revision [8c39a49](https://github.com/Star-Clouds/CenterFace/tree/8c39a497afb78fb2c064eb84bf010c273bb7d3ce)),
-  [released under MIT license](https://github.com/Star-Clouds/CenterFace/blob/36afed/LICENSE)
-- The included model file `centerface.onnx` is an unmodified copy of the [`centerface_bnmerged.onnx`](https://github.com/Star-Clouds/CenterFace/blob/b82ec0c4844e89fd5a0305986aed9bdf33c72585/models/onnx/centerface_bnmerged.onnx) from https://github.com/Star-Clouds/centerface
-- The original source of the example images in the `examples` directory can be found [here](https://www.pexels.com/de-de/foto/stadt-kreuzung-strasse-menschen-109919/) (released under the [Pexels photo license](https://www.pexels.com/photo-license/))
+MIT — 沿用上游 [LICENSE](LICENSE)。

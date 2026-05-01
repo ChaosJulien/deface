@@ -1,33 +1,33 @@
-# deface · docx 人脸打码 GUI
+<p align="right"><b>English</b> · <a href="README_zh.md">中文</a></p>
 
-> 这个仓库 fork 自 [ORB-HD/deface](https://github.com/ORB-HD/deface) — 在原版 CLI 基础上**新增了一个面向 Word 文档的 PySide6 桌面 GUI**,用 YuNet 检测人脸并把高斯模糊回写到 `.docx` 里,常用于活动合影、汇报材料的整稿匿名化。原版 deface 的视频/图片 CLI 仍然可用,见下文「上游 CLI」一节。
+# deface · Office / ODF document face-anonymizer GUI
 
-## ✨ 主要功能
+> Fork of [ORB-HD/deface](https://github.com/ORB-HD/deface). Upstream is a CLI for video / image anonymization. **This fork adds a PySide6 desktop GUI focused on Office and OpenDocument files** — Word / PowerPoint / Excel / LibreOffice. Open a `.docx` / `.pptx` / `.xlsx` / `.odt` / `.odp` / `.ods`, review every detected face one by one, export an anonymized copy without breaking the document. The original `deface` CLI for videos and images is still available — see [Upstream CLI](#-upstream-cli).
 
-- **导入 `.docx` → 自动提取所有图片**(`word/media/*`、`word/embeddings/*`)
-- **YuNet 检测人脸**(OpenCV 4.6+ 内置,比原版 CenterFace 准且不会因大图溢出)
-- **逐张人工审核**:
-  - 🔴 红框 = 会被高斯模糊
-  - 🟢 绿框 = 保留(误判时点掉它)
-  - 左键点框切换、右键删框
-  - **手动加框**:漏检的脸自己拖矩形补
-- **阈值滑块** 350ms 防抖,自动对当前图重检测,旧的红/绿状态用 IoU 自动复用
-- **Up/Down(或 J/K)切换图片**,无论焦点在哪都生效
-- **导出新 `.docx`**:只替换有打码的图片,document.xml / 关系 / 样式按字节透传,Word 100% 能正常打开
-- **解码用 PIL `convert("RGB")`**:CMYK / RGBA / 调色板 PNG 不会再反色
-- **编码按扩展名强制 mode**:`.jpg/.bmp/.gif` 强制 RGB(去 alpha)、`.png/.tif/.webp` 透传 alpha,JPEG 不会再因 alpha 崩
+Original | After (`deface examples/city.jpg`)
+:--:|:--:
+![](examples/city.jpg) | ![](examples/city_anonymized.jpg)
 
-## 📷 界面预览
+## ✨ Features
 
-> 占位 — 第一次使用截图后请把 PNG 放到 `docs/` 下并替换以下链接:
+- **Open Office / ODF documents** — `.docx` `.docm` `.dotx` / `.pptx` `.pptm` `.potx` / `.xlsx` `.xlsm` `.xltx` / `.odt` `.odp` `.ods`. Embedded images extracted from the right zip prefix (`word/media/`, `ppt/media/`, `xl/media/`, `Pictures/`, plus `*/embeddings/`).
+- **YuNet face detection** via OpenCV's `cv2.FaceDetectorYN` — more accurate than upstream's CenterFace on still images, and won't OOM on huge inputs.
+- **Per-image manual review:**
+  - 🔴 red box = will be blurred
+  - 🟢 green box = kept (flip misdetections with a click)
+  - left-click toggles, right-click deletes
+  - **Manual box drawing** for missed faces — drag a rectangle, generates a red `manual=True` box that survives re-detection.
+- **Threshold slider** with 350 ms debounce. Current image is re-detected automatically; old red/green flags are reused via IoU when boxes overlap.
+- **`Up/Down` or `J/K` navigation** between images, focus-independent.
+- **Export** writes a new file:
+  - Only modified images are re-encoded — everything else (`document.xml`, relationships, styles, slides, sheets) is byte-passthrough, so the result opens cleanly in Word / PowerPoint / Excel / LibreOffice.
+  - Output extension matches input automatically.
+- **PIL `convert("RGB")`** decoding — CMYK / RGBA / palette PNGs no longer come back inverted.
+- **Per-extension encoding** — `.jpg/.bmp/.gif` forced to RGB (drop alpha), `.png/.tif/.webp` keep alpha. JPEG no longer crashes on alpha-bearing inputs.
 
-| 选图与审核 | 手动加框 |
-|---|---|
-| `docs/screenshot-review.png` | `docs/screenshot-manual.png` |
+## 🚀 Install
 
-## 🚀 安装
-
-需要 **Python 3.10+**(测试在 3.14 上)。建议先建 venv:
+Requires **Python 3.10+** (tested on 3.14). Use a venv:
 
 ```bash
 git clone https://github.com/ChaosJulien/deface.git
@@ -39,82 +39,83 @@ pip install -e .
 pip install PySide6 onnxruntime imageio Pillow
 ```
 
-YuNet 模型 (`face_detection_yunet_2023mar.onnx`, 228 KB) 已随仓库一起提交,无需额外下载。
+The YuNet model (`face_detection_yunet_2023mar.onnx`, 228 KB) is committed to this repo — no extra download needed.
 
-## 🖱 使用 docx GUI
+## 🖱 Using the GUI
 
 ```bash
 python -m deface.docx_gui
 ```
 
-操作流程:
+Workflow:
 
-1. 工具栏 **「打开 docx」** → 选 `.docx` 文件
-2. 后台并行检测所有图片,左侧列表显示进度 `打码 N / 总数`
-3. 在中央画布上审核每一张:
-   - **左键** 框 = 切换 红 / 绿(打码 / 保留)
-   - **右键** 框 = 删除(无论是误判还是手动加的)
-   - **Cmd+滚轮 / Ctrl+滚轮** = 缩放;不缩放时鼠标可拖动平移
-4. 漏检的脸 → 右侧 **「✏️ 手动加框」**,鼠标拖矩形,松手生成红框(`manual=True`)。手动框在重新检测时**不会被覆盖**
-5. 误判太多 / 漏检太多 → 调右侧 **检测阈值**(0.3 ~ 0.7),350 ms 防抖后自动对当前图重检测
-6. 工具栏 **「导出 docx」** → 默认存成 `<原文件名>_anonymized.docx`
+1. Toolbar **"Open document"** → pick a `.docx` / `.pptx` / `.xlsx` / `.odt` / `.odp` / `.ods` etc.
+2. All images are detected in parallel in the background. Left panel shows progress as `blurred N / total`.
+3. Review each image on the central canvas:
+   - **Left-click** a box → toggle red ↔ green
+   - **Right-click** a box → delete
+   - **Cmd/Ctrl + scroll** → zoom; drag the image to pan when not in manual mode
+4. For missed faces → right panel **"✏️ Manual box"**, drag a rectangle, releases as a red `manual=True` box. Manual boxes are not overwritten on re-detection.
+5. Too many false positives / negatives → adjust **threshold** (0.3 ~ 0.7) on the right; the current image is re-detected after 350 ms debounce.
+6. Toolbar **"Export document"** → defaults to `<filename>_anonymized.<same-ext>`.
 
-### ⌨️ 快捷键
+### ⌨️ Shortcuts
 
-| 键 | 作用 |
+| Key | Action |
 |---|---|
-| `↑` / `K` | 上一张图 |
-| `↓` / `J` | 下一张图 |
-| `Cmd / Ctrl + 滚轮` | 缩放当前图 |
-| 鼠标左键拖 | 平移图(非手动模式)|
+| `↑` / `K` | Previous image |
+| `↓` / `J` | Next image |
+| `Cmd/Ctrl + scroll` | Zoom |
+| Mouse drag (non-manual) | Pan |
 
-### ⚙️ 参数说明
+### ⚙️ Parameters
 
-| 参数 | 默认值 | 说明 |
+| Param | Default | Meaning |
 |---|---|---|
-| 打码方式 | `blur` | 高斯模糊;另可选 `solid`(实心黑)、`mosaic`(马赛克)、`none`(只画框,不打码) |
-| 遮罩外扩 | `1.30` | 外扩 30% 把头发/下巴吃进去,防止边缘漏 |
-| 马赛克尺寸 | `20` | 仅 mosaic 模式生效 |
-| 检测阈值 | `0.50` | YuNet score 阈值,越高越严(漏检多但误判少)|
+| Replace mode | `blur` | Gaussian blur. Also: `solid` (black box), `mosaic`, `none` (boxes only) |
+| Mask scale | `1.30` | Expand mask by 30% to cover hair / chin |
+| Mosaic size | `20` | Only when mode = mosaic |
+| Detection threshold | `0.50` | YuNet score; higher = stricter (more misses, fewer false positives) |
 
-### 🛡 设计上保证不破坏原文件
+### 🛡 Non-destructive guarantees
 
-- 原 `.docx` 永远不动,导出是新文件
-- 没勾打码、没检出脸、所有框都是绿框的图片 → **原图字节透传**(`zin.read → zout.writestr`),不会被重新编码导致质量下降
-- 检测时大图缩到长边 1280 加速,但**打码画在原图全分辨率上**,导出图清晰度 = 原图清晰度
+- The source file is never touched — export goes to a new file.
+- Images with no red boxes (no detection, or all flipped to green) → **byte-level passthrough** (`zin.read → zout.writestr`), no quality loss from re-encoding.
+- Detection downscales large images to long-edge 1280 for speed, but **anonymization is drawn on the full-resolution original**, so exported image quality matches the source.
 
-## 🔬 工作原理
+## 🔬 How it works
 
-1. **解析 docx**:zip 解压,`word/media/*`、`word/embeddings/*` 下的 `.png/.jpg/.jpeg/.bmp/.gif/.tif/.webp` 全部抽出
-2. **解码归一**:PIL `Image.open + convert("RGB")` 把 CMYK / RGBA / 调色板 / 灰度统一成 3 通道 RGB,杜绝反色
-3. **检测**:YuNet (`cv2.FaceDetectorYN`) 在 BGR 上跑,大图先 `cv2.resize` 到长边 1280,框结果 ×inv 放回原坐标
-4. **打码**:沿用原版 deface 的 `draw_det` 函数(椭圆遮罩 + 高斯/马赛克/实心)
-5. **回写**:用 `zipfile` 重打包,只对修改过的图片走 `zout.writestr`,其余条目按 `ZipInfo` 字节级透传
+1. **Parse OOXML / ODF** (zip): pull all `.png/.jpg/.jpeg/.bmp/.gif/.tif/.webp` from `word/media`, `ppt/media`, `xl/media`, `*/embeddings`, `Pictures/`.
+2. **Decode**: PIL `Image.open + convert("RGB")` normalizes CMYK / RGBA / palette / grayscale into 3-channel RGB to avoid color inversion.
+3. **Detect**: YuNet (`cv2.FaceDetectorYN`) on BGR. Large images are `cv2.resize`'d to long edge 1280; results are scaled back to original coordinates.
+4. **Anonymize**: reuses upstream's `draw_det` (ellipse mask + Gaussian / mosaic / solid).
+5. **Repack**: `zipfile` rewrites the container, modified images go through `zout.writestr`, every other entry is byte-pass-through via `ZipInfo`.
 
-## 🖥 上游 CLI(原版功能)
+## 🖥 Upstream CLI
 
-原版 `deface` 仍然可用,适合视频或一堆散图的批量处理:
+The original `deface` CLI is still available for videos and batch image processing:
 
 ```bash
-# 视频
+# video
 deface myvideo.mp4
 
-# 图片(支持通配符)
+# images (glob supported)
 deface 'photos/*.jpg'
 
-# 调阈值 + 改打码方式
+# threshold + mode
 deface input.mp4 --thresh 0.5 --replacewith mosaic --mosaicsize 30
 ```
 
-完整选项详见原仓库 README:[ORB-HD/deface](https://github.com/ORB-HD/deface#cli-usage-and-options-summary)。
+Full options: see [ORB-HD/deface](https://github.com/ORB-HD/deface#cli-usage-and-options-summary).
 
-## 🙏 致谢
+## 🙏 Credits
 
-- 上游项目:[ORB-HD/deface](https://github.com/ORB-HD/deface) (MIT)
-- CenterFace 模型(原版 CLI 用):[Star-Clouds/centerface](https://github.com/Star-Clouds/centerface) (MIT)
-- YuNet 模型(本 GUI 用):[opencv/opencv_zoo - face_detection_yunet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) (MIT)
-- 训练数据集:[WIDER FACE](http://shuoyang1213.me/WIDERFACE/)
+- Upstream project: [ORB-HD/deface](https://github.com/ORB-HD/deface) (MIT)
+- CenterFace model (upstream CLI): [Star-Clouds/centerface](https://github.com/Star-Clouds/centerface) (MIT)
+- YuNet model (this GUI): [opencv/opencv_zoo · face_detection_yunet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) (MIT)
+- Training data: [WIDER FACE](http://shuoyang1213.me/WIDERFACE/)
+- Example photo: [Pexels](https://www.pexels.com/de-de/foto/stadt-kreuzung-strasse-menschen-109919/) (Pexels license)
 
 ## 📄 License
 
-MIT — 沿用上游 [LICENSE](LICENSE)。
+MIT — same as upstream [LICENSE](LICENSE).

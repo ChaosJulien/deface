@@ -1,4 +1,4 @@
-"""PySide6 桌面 GUI:导入 docx → 提取图片 → 人工筛选每张人脸 + 单图参数 → 导出新 docx。"""
+"""PySide6 桌面 GUI:导入 docx/pptx → 提取图片 → 人工筛选每张人脸 + 单图参数 → 导出新文档。"""
 from __future__ import annotations
 
 import io
@@ -430,7 +430,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("deface · docx 人脸打码工具")
+        self.setWindowTitle("deface · docx/pptx 人脸打码工具")
         self.resize(1400, 860)
 
         self._states: List[ImageState] = []
@@ -479,7 +479,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_toolbar()
         self.status = self.statusBar()
-        self.status.showMessage("就绪。点工具栏「打开 docx」开始")
+        self.status.showMessage("就绪。点工具栏「打开文档」开始(支持 docx / pptx)")
 
         # 全局快捷键:Up/Down 切图,J/K 也兼容
         for keys, delta in (
@@ -494,8 +494,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_toolbar(self) -> None:
         tb = self.addToolBar("main")
         tb.setMovable(False)
-        act_open = tb.addAction("打开 docx")
-        act_export = tb.addAction("导出 docx")
+        act_open = tb.addAction("打开文档")
+        act_export = tb.addAction("导出文档")
         tb.addSeparator()
         act_fit = tb.addAction("适应窗口")
         act_open.triggered.connect(self._open_docx)
@@ -539,7 +539,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _open_docx(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "选择 Word 文档", "", "Word 文档 (*.docx)"
+            self, "选择文档", "",
+            "Office / ODF 文档 ("
+            "*.docx *.docm *.dotx "
+            "*.pptx *.pptm *.potx "
+            "*.xlsx *.xlsm *.xltx "
+            "*.odt *.odp *.ods)"
         )
         if not path:
             return
@@ -549,7 +554,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "打开失败", str(exc))
             return
         if not images:
-            QtWidgets.QMessageBox.information(self, "无图片", "这个 docx 里找不到图片。")
+            QtWidgets.QMessageBox.information(self, "无图片", "这个文档里找不到图片。")
             return
 
         self._docx_path = Path(path)
@@ -713,9 +718,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _export_docx(self) -> None:
         if self._docx_path is None or not self._states:
             return
-        default_out = self._docx_path.with_name(self._docx_path.stem + "_anonymized.docx")
+        suffix = self._docx_path.suffix
+        default_out = self._docx_path.with_name(self._docx_path.stem + "_anonymized" + suffix)
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "导出新 docx", str(default_out), "Word 文档 (*.docx)"
+            self, f"导出新 {suffix.lstrip('.')}", str(default_out), f"Office 文档 (*{suffix})"
         )
         if not path:
             return

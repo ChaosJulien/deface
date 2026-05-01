@@ -1,7 +1,11 @@
-"""docx 图片抽取与重打包。
+"""Office / ODF 文档图片抽取与重打包。
 
-docx 本质是 zip,图片放在 `word/media/*`(还有 `word/embeddings`、header/footer
-也可能含图)。引用走 relationship,只要保留原文件名替换 bytes,所有引用都还是好的。
+支持的容器都是 zip(只是图片前缀不同):
+  - docx / docm / dotx → `word/media/*`、`word/embeddings/*`
+  - pptx / pptm / potx → `ppt/media/*`、`ppt/embeddings/*`
+  - xlsx / xlsm / xltx → `xl/media/*`、`xl/embeddings/*`
+  - odt / odp / ods    → `Pictures/*`
+引用走 relationship / manifest,只要保留原文件名替换 bytes,所有引用都还是好的。
 """
 from __future__ import annotations
 
@@ -12,8 +16,13 @@ from typing import Dict, List
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
-# Word 把图片塞在这些目录下;扩展模板也可能放更冷门路径,前缀匹配能兜底。
-MEDIA_DIRS = ("word/media/", "word/embeddings/")
+# Word 和 PowerPoint 把图片塞在这些目录下;扩展模板也可能放更冷门路径,前缀匹配能兜底。
+MEDIA_DIRS = (
+    "word/media/", "word/embeddings/",
+    "ppt/media/", "ppt/embeddings/",
+    "xl/media/", "xl/embeddings/",
+    "Pictures/",
+)
 
 
 @dataclass

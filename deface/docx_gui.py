@@ -71,6 +71,17 @@ def _has_cjk(s: str) -> bool:
     return any(0x4E00 <= ord(c) <= 0x9FFF for c in s)
 
 
+def _resource_path(name: str) -> str:
+    """定位随包数据文件。frozen(PyInstaller)模式下 __file__ 可能在 _internal/ 顶层,
+    跟实际数据文件 _internal/deface/<name> 不在同一目录,要从 sys._MEIPASS 找。"""
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        for c in (base / "deface" / name, base / name, base / "_internal" / "deface" / name):
+            if c.exists():
+                return str(c)
+    return str(Path(__file__).with_name(name))
+
+
 # ---------- 数据模型 ----------
 
 
@@ -129,7 +140,7 @@ class DetectorWorker(QtCore.QObject):
     @QtCore.Slot()
     def ensure_loaded(self) -> None:
         if self._cf is None:
-            model_path = str(Path(__file__).with_name(YUNET_MODEL))
+            model_path = _resource_path(YUNET_MODEL)
             self._cf = cv2.FaceDetectorYN.create(
                 model=model_path,
                 config="",

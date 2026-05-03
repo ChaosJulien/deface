@@ -14,14 +14,18 @@ import numpy as np
 from PIL import Image as PilImage
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from deface.deface import draw_det, scale_bb
+from deface.deface import scale_bb
 from deface.docx_io import DocxImage, extract_images, write_docx
 
 
-REPLACE_MODES = ["blur", "solid", "mosaic", "none"]
+REPLACE_MODES = ["blur", "frosted", "solid", "mosaic", "none"]
+SHAPES = ["ellipse", "rect"]
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_MASK_SCALE = 1.3
 DEFAULT_MOSAIC_SIZE = 20
+DEFAULT_FEATHER = 0           # 边缘羽化半径(像素),0=硬边
+DEFAULT_SHAPE = "ellipse"
+DEFAULT_OPACITY = 100          # 遮罩强度(%),100=完全覆盖,小于 100 = 底色透出
 MAX_FACES_PER_IMAGE = 100
 DETECT_MAX_SIDE = 1280  # 大图缩到长边 1280 再检测,加速 + 避免边界
 YUNET_MODEL = "face_detection_yunet_2023mar.onnx"
@@ -38,7 +42,9 @@ class FaceBox:
     y2: int
     score: float
     keep: bool = False
-    manual: bool = False   # 用户手动加的框
+    manual: bool = False         # 用户手动加的框
+    kind: str = "face"            # "face" | "text"
+    text: str = ""                # OCR 命中关键词时记录原文,UI tooltip 用
 
 
 @dataclass
@@ -47,6 +53,9 @@ class ImageParams:
     mask_scale: float = DEFAULT_MASK_SCALE
     mosaic_size: int = DEFAULT_MOSAIC_SIZE
     threshold: float = DEFAULT_THRESHOLD
+    feather: int = DEFAULT_FEATHER
+    shape: str = DEFAULT_SHAPE
+    opacity: int = DEFAULT_OPACITY
 
 
 @dataclass
@@ -65,10 +74,13 @@ class ImageState:
 
 
 class DetectorWorker(QtCore.QObject):
-    detected = QtCore.Signal(int, list)        # (state_index, [FaceBox])
-    failed = QtCore.Signal(int, str)           # (state_index, error)
-    finished_batch = QtCore.Signal()           # 批量检测全部完成
-    progress = QtCore.Signal(int, int)         # (done, total)
+    detected = QtCore.Signal(int, list)        # 人脸 (state_index, [FaceBox])
+    text_found = QtCore.Signal(int, list)      # OCR 命中 (state_index, [FaceBox kind=text])
+    failed = QtCore.Signal(int, str)
+    finished_batch = QtCore.Signal()           # 人脸批量
+    finished_ocr = QtCore.Signal()             # OCR 批量
+    progress = QtCore.Signal(int, int)
+    ocr_progress = QtCore.Signal(int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -164,19 +176,82 @@ class DetectorWorker(QtCore.QObject):
             out = out[:MAX_FACES_PER_IMAGE]
         return out
 
+    @QtCore.Slot(list, list)
+    def scan_text_batch(self, jobs, keywords) -> None:
+        """jobs: [(idx, frame)];keywords: [str](原样,大小写不敏感匹配)。"""
+        try:
+            from ocrmac import ocrmac
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(-1, f"ocrmac 不可用: {exc}")
+            self.finished_ocr.emit()
+            return
+        kws = [k.strip().lower() for k in keywords if k.strip()]
+        if not kws:
+            self.finished_ocr.emit()
+            return
+        thread = QtCore.QThread.currentThread()
+        total = len(jobs)
+        try:
+            for done, (idx, frame) in enumerate(jobs, 1):
+                if thread is not None and thread.isInterruptionRequested():
+                    return
+                try:
+                    matches = self._ocr_matches(frame, kws)
+                    self.text_found.emit(idx, matches)
+                except Exception as exc:  # noqa: BLE001
+                    self.failed.emit(idx, f"OCR: {exc}")
+                self.ocr_progress.emit(done, total)
+        finally:
+            self.finished_ocr.emit()
+
+    @staticmethod
+    def _ocr_matches(frame: np.ndarray, keywords_lower: List[str]) -> List[FaceBox]:
+        from ocrmac import ocrmac
+        h, w = frame.shape[:2]
+        ocr = ocrmac.OCR(
+            PilImage.fromarray(frame),
+            language_preference=["zh-Hans", "zh-Hant", "en-US"],
+        )
+        results = ocr.recognize()
+        out: List[FaceBox] = []
+        for text, conf, bbox in results:
+            tl = text.lower()
+            if not any(kw in tl for kw in keywords_lower):
+                continue
+            bx, by, bw, bh = bbox
+            # Apple Vision 的 bbox:归一化 [x, y, w, h],原点在左下角
+            x1 = max(0, int(bx * w))
+            y2 = min(h, int((1 - by) * h))
+            x2 = min(w, int((bx + bw) * w))
+            y1 = max(0, int((1 - by - bh) * h))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            out.append(FaceBox(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                score=float(conf), keep=False, kind="text", text=text,
+            ))
+        return out
+
 
 # ---------- 人脸框 graphics item ----------
 
 
 class FaceRectItem(QtWidgets.QGraphicsRectItem):
-    """每张脸一个 item;点击切 keep。颜色:绿=保留,红=打码。"""
+    """每张脸 / 关键词一个 item;点击切 keep。
+    人脸:绿=保留 / 红=打码。文字:蓝=保留 / 黄=打码。
+    """
 
-    KEEP_PEN = QtGui.QPen(QtGui.QColor("#34d399"), 0)
-    MASK_PEN = QtGui.QPen(QtGui.QColor("#fb7185"), 0)
+    COLORS = {
+        ("face", True):  QtGui.QColor("#34d399"),   # 绿
+        ("face", False): QtGui.QColor("#fb7185"),   # 红
+        ("text", True):  QtGui.QColor("#60a5fa"),   # 蓝
+        ("text", False): QtGui.QColor("#fbbf24"),   # 黄
+    }
 
-    def __init__(self, rect: QtCore.QRectF, idx: int, on_toggle, on_delete):
+    def __init__(self, rect: QtCore.QRectF, idx: int, on_toggle, on_delete, kind: str = "face"):
         super().__init__(rect)
         self.idx = idx
+        self.kind = kind
         self.on_toggle = on_toggle
         self.on_delete = on_delete
         self.setAcceptHoverEvents(True)
@@ -184,9 +259,8 @@ class FaceRectItem(QtWidgets.QGraphicsRectItem):
         self.refresh(False)
 
     def refresh(self, keep: bool) -> None:
-        pen = self.KEEP_PEN if keep else self.MASK_PEN
-        pen = QtGui.QPen(pen)
-        pen.setWidthF(0)
+        color = self.COLORS.get((self.kind, keep), self.COLORS[("face", keep)])
+        pen = QtGui.QPen(color)
         pen.setCosmetic(True)
         pen.setWidth(3)
         self.setPen(pen)
@@ -250,8 +324,10 @@ class ImageView(QtWidgets.QGraphicsView):
 
     def _add_face_item(self, idx: int, face: FaceBox) -> None:
         rect = QtCore.QRectF(face.x1, face.y1, face.x2 - face.x1, face.y2 - face.y1)
-        item = FaceRectItem(rect, idx, self._on_toggle, self._on_delete)
+        item = FaceRectItem(rect, idx, self._on_toggle, self._on_delete, kind=face.kind)
         item.refresh(face.keep)
+        if face.kind == "text" and face.text:
+            item.setToolTip(f"OCR 命中:{face.text}")
         self._scene.addItem(item)
         self._face_items.append(item)
 
@@ -333,6 +409,7 @@ class ParamsPanel(QtWidgets.QWidget):
     keep_all_clicked = QtCore.Signal()
     mask_all_clicked = QtCore.Signal()
     redetect_clicked = QtCore.Signal()
+    apply_to_all_clicked = QtCore.Signal()
     manual_toggled = QtCore.Signal(bool)
 
     def __init__(self) -> None:
@@ -342,6 +419,18 @@ class ParamsPanel(QtWidgets.QWidget):
         self.mode = QtWidgets.QComboBox()
         self.mode.addItems(REPLACE_MODES)
         form.addRow("打码方式", self.mode)
+
+        self.shape = QtWidgets.QComboBox()
+        self.shape.addItem("椭圆", "ellipse")
+        self.shape.addItem("矩形", "rect")
+        form.addRow("遮罩形状", self.shape)
+
+        self.opacity = QtWidgets.QSpinBox()
+        self.opacity.setRange(0, 100)
+        self.opacity.setValue(DEFAULT_OPACITY)
+        self.opacity.setSuffix(" %")
+        self.opacity.setToolTip("100% = 完全覆盖;小于 100% 让底色透出来,做半透明磨砂效果")
+        form.addRow("遮罩强度", self.opacity)
 
         self.mask_scale = QtWidgets.QDoubleSpinBox()
         self.mask_scale.setRange(1.0, 2.0)
@@ -354,6 +443,13 @@ class ParamsPanel(QtWidgets.QWidget):
         self.mosaic_size.setRange(4, 200)
         self.mosaic_size.setValue(DEFAULT_MOSAIC_SIZE)
         form.addRow("马赛克尺寸", self.mosaic_size)
+
+        self.feather = QtWidgets.QSpinBox()
+        self.feather.setRange(0, 100)
+        self.feather.setValue(DEFAULT_FEATHER)
+        self.feather.setSuffix(" px")
+        self.feather.setToolTip("0 = 硬边;数值越大边缘越柔(高斯软椭圆 mask)")
+        form.addRow("边缘羽化", self.feather)
 
         self.threshold = QtWidgets.QDoubleSpinBox()
         self.threshold.setRange(0.01, 1.0)
@@ -375,6 +471,10 @@ class ParamsPanel(QtWidgets.QWidget):
         btns.addWidget(redetect)
         form.addRow(btns)
 
+        apply_all = QtWidgets.QPushButton("📋 把当前打码参数应用到全部图片")
+        apply_all.setToolTip("把当前的 打码方式 / 形状 / 强度 / 羽化 / 外扩 / 马赛克尺寸 复制到所有图片(阈值不动)")
+        form.addRow(apply_all)
+
         tip = QtWidgets.QLabel(
             "<b>操作:</b><br>"
             "• 红框 = 会被打码<br>"
@@ -394,31 +494,92 @@ class ParamsPanel(QtWidgets.QWidget):
         )
 
         self.mode.currentIndexChanged.connect(lambda _: self.params_changed.emit())
+        self.shape.currentIndexChanged.connect(lambda _: self.params_changed.emit())
+        self.opacity.valueChanged.connect(lambda _: self.params_changed.emit())
         self.mask_scale.valueChanged.connect(lambda _: self.params_changed.emit())
         self.mosaic_size.valueChanged.connect(lambda _: self.params_changed.emit())
+        self.feather.valueChanged.connect(lambda _: self.params_changed.emit())
         self.threshold.valueChanged.connect(lambda _: self._threshold_timer.start())
 
         keep_all.clicked.connect(self.keep_all_clicked)
         mask_all.clicked.connect(self.mask_all_clicked)
         redetect.clicked.connect(self.redetect_clicked)
+        apply_all.clicked.connect(self.apply_to_all_clicked)
         self.manual_btn.toggled.connect(self.manual_toggled)
 
     def load_params(self, p: ImageParams) -> None:
         # blockSignals 防回调风暴
-        for w in (self.mode, self.mask_scale, self.mosaic_size, self.threshold):
+        widgets = (self.mode, self.shape, self.opacity,
+                   self.mask_scale, self.mosaic_size, self.feather, self.threshold)
+        for w in widgets:
             w.blockSignals(True)
         self.mode.setCurrentText(p.replacewith)
+        idx = self.shape.findData(p.shape)
+        self.shape.setCurrentIndex(max(0, idx))
+        self.opacity.setValue(p.opacity)
         self.mask_scale.setValue(p.mask_scale)
         self.mosaic_size.setValue(p.mosaic_size)
+        self.feather.setValue(p.feather)
         self.threshold.setValue(p.threshold)
-        for w in (self.mode, self.mask_scale, self.mosaic_size, self.threshold):
+        for w in widgets:
             w.blockSignals(False)
 
     def write_to(self, p: ImageParams) -> None:
         p.replacewith = self.mode.currentText()
+        p.shape = self.shape.currentData() or DEFAULT_SHAPE
+        p.opacity = int(self.opacity.value())
         p.mask_scale = float(self.mask_scale.value())
         p.mosaic_size = int(self.mosaic_size.value())
+        p.feather = int(self.feather.value())
         p.threshold = float(self.threshold.value())
+
+
+# ---------- 关键词 OCR 面板 ----------
+
+
+class OCRPanel(QtWidgets.QWidget):
+    scan_clicked = QtCore.Signal(list)   # [keyword strings]
+    clear_clicked = QtCore.Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        title = QtWidgets.QLabel("<b>关键词 OCR 打码</b>")
+        layout.addWidget(title)
+
+        self.keywords_input = QtWidgets.QPlainTextEdit()
+        self.keywords_input.setPlaceholderText(
+            "每行一个关键词,大小写不敏感\n例:\n机密\n编号\nConfidential"
+        )
+        self.keywords_input.setMaximumHeight(110)
+        layout.addWidget(self.keywords_input)
+
+        btns = QtWidgets.QHBoxLayout()
+        self.scan_btn = QtWidgets.QPushButton("🔍 扫描全部图片")
+        self.clear_btn = QtWidgets.QPushButton("清空命中")
+        btns.addWidget(self.scan_btn)
+        btns.addWidget(self.clear_btn)
+        layout.addLayout(btns)
+
+        tip = QtWidgets.QLabel(
+            "黄=会被打码,蓝=保留;点击切换,右键删除。"
+        )
+        tip.setStyleSheet("color:#888; font-size:11px;")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        self.scan_btn.clicked.connect(self._on_scan)
+        self.clear_btn.clicked.connect(self.clear_clicked)
+
+    def _on_scan(self) -> None:
+        text = self.keywords_input.toPlainText()
+        kws = [line.strip() for line in text.splitlines() if line.strip()]
+        if not kws:
+            QtWidgets.QMessageBox.information(self, "无关键词", "请先在文本框里输入关键词,每行一个。")
+            return
+        self.scan_clicked.emit(kws)
 
 
 # ---------- 主窗口 ----------
@@ -427,6 +588,7 @@ class ParamsPanel(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     request_detect_one = QtCore.Signal(int, "QVariant", float)
     request_detect_batch = QtCore.Signal(list, float)
+    request_scan_text = QtCore.Signal(list, list)   # (jobs, keywords)
 
     def __init__(self) -> None:
         super().__init__()
@@ -458,12 +620,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.params.keep_all_clicked.connect(lambda: self._set_all_keep(True))
         self.params.mask_all_clicked.connect(lambda: self._set_all_keep(False))
         self.params.redetect_clicked.connect(self._redetect_current)
+        self.params.apply_to_all_clicked.connect(self._apply_params_to_all)
         self.params.manual_toggled.connect(self.image_view.set_manual_mode)
+
+        self.ocr_panel = OCRPanel()
+        self.ocr_panel.scan_clicked.connect(self._on_scan_keywords)
+        self.ocr_panel.clear_clicked.connect(self._clear_text_boxes)
 
         right = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right)
         right_layout.setContentsMargins(8, 8, 8, 8)
         right_layout.addWidget(self.params)
+        right_layout.addSpacing(10)
+        sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.HLine); sep.setStyleSheet("color:#444;")
+        right_layout.addWidget(sep)
+        right_layout.addWidget(self.ocr_panel)
         right_layout.addStretch(1)
         right.setMinimumWidth(280)
 
@@ -513,8 +684,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.failed.connect(self._on_detect_failed)
         self._worker.finished_batch.connect(self._on_batch_done)
         self._worker.progress.connect(self._on_progress)
+        self._worker.text_found.connect(self._on_text_found)
+        self._worker.finished_ocr.connect(self._on_ocr_done)
+        self._worker.ocr_progress.connect(self._on_ocr_progress)
         self.request_detect_one.connect(self._worker.detect_one)
         self.request_detect_batch.connect(self._worker.detect_batch)
+        self.request_scan_text.connect(self._worker.scan_text_batch)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         # 让 detect_batch 能尽快跳出循环
@@ -617,17 +792,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if not (0 <= idx < len(self._states)):
             return
         st = self._states[idx]
-        # 复用旧 keep(IoU 匹配)+ 保留所有手动加的框
-        old_keeps = [f for f in st.faces if f.keep and not f.manual]
+        # 复用旧的 face keep 状态(IoU 匹配)+ 保留手动框 + 保留 OCR 文字框
+        old_face_keeps = [f for f in st.faces if f.kind == "face" and f.keep and not f.manual]
         manual = [f for f in st.faces if f.manual]
+        text_boxes = [f for f in st.faces if f.kind == "text"]
         for face in faces:
-            face.keep = any(_iou(face, k) >= 0.35 for k in old_keeps)
-        st.faces = faces + manual
+            face.keep = any(_iou(face, k) >= 0.35 for k in old_face_keeps)
+        st.faces = faces + manual + text_boxes
         st.detected = True
         st.error = None
         self._refresh_list_label(idx)
         if idx == self._current:
             self.image_view.set_image(st.frame, st.faces)
+
+    @QtCore.Slot(int, list)
+    def _on_text_found(self, idx: int, text_boxes: List[FaceBox]) -> None:
+        if not (0 <= idx < len(self._states)):
+            return
+        st = self._states[idx]
+        # 保留旧 OCR 框的 keep 状态(按 IoU 匹配)
+        old_keeps = [f for f in st.faces if f.kind == "text" and f.keep]
+        for tb in text_boxes:
+            if any(_iou(tb, k) >= 0.5 for k in old_keeps):
+                tb.keep = True
+        # 移除旧 text 框,加新的
+        st.faces = [f for f in st.faces if f.kind != "text"] + text_boxes
+        self._refresh_list_label(idx)
+        if idx == self._current:
+            self.image_view.set_image(st.frame, st.faces)
+
+    @QtCore.Slot(int, int)
+    def _on_ocr_progress(self, done: int, total: int) -> None:
+        self.status.showMessage(f"OCR 扫描 {done}/{total} ...")
+
+    @QtCore.Slot()
+    def _on_ocr_done(self) -> None:
+        hits = sum(
+            sum(1 for f in st.faces if f.kind == "text") for st in self._states
+        )
+        self.status.showMessage(f"OCR 扫描完成,共命中 {hits} 处文字")
 
     @QtCore.Slot(int, str)
     def _on_detect_failed(self, idx: int, msg: str) -> None:
@@ -704,6 +907,55 @@ class MainWindow(QtWidgets.QMainWindow):
         st.params.threshold = value
         self._redetect_current()
 
+    def _on_scan_keywords(self, keywords: List[str]) -> None:
+        if not self._states:
+            QtWidgets.QMessageBox.information(self, "无图片", "先打开一个文档。")
+            return
+        jobs = [(i, st.frame) for i, st in enumerate(self._states) if st.frame is not None]
+        if not jobs:
+            return
+        self.status.showMessage(f"OCR 扫描 0/{len(jobs)} ...")
+        self.request_scan_text.emit(jobs, list(keywords))
+
+    def _clear_text_boxes(self) -> None:
+        if not self._states:
+            return
+        for st in self._states:
+            st.faces = [f for f in st.faces if f.kind != "text"]
+        self._refresh_list_label(self._current) if 0 <= self._current < len(self._states) else None
+        for i in range(len(self._states)):
+            self._refresh_list_label(i)
+        if 0 <= self._current < len(self._states):
+            st = self._states[self._current]
+            self.image_view.set_image(st.frame, st.faces)
+        self.status.showMessage("已清空所有 OCR 命中框")
+
+    def _apply_params_to_all(self) -> None:
+        if not (0 <= self._current < len(self._states)):
+            return
+        if len(self._states) <= 1:
+            self.status.showMessage("只有一张图,没必要批量")
+            return
+        ans = QtWidgets.QMessageBox.question(
+            self, "应用到全部",
+            f"把当前的打码参数应用到全部 {len(self._states)} 张图片吗?(阈值不会被改)",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if ans != QtWidgets.QMessageBox.Yes:
+            return
+        src = self._states[self._current].params
+        for i, st in enumerate(self._states):
+            if i == self._current:
+                continue
+            st.params.replacewith = src.replacewith
+            st.params.shape = src.shape
+            st.params.opacity = src.opacity
+            st.params.feather = src.feather
+            st.params.mask_scale = src.mask_scale
+            st.params.mosaic_size = src.mosaic_size
+            # threshold 不动:改了得重检测,代价高
+        self.status.showMessage(f"打码参数已同步到 {len(self._states)} 张图片")
+
     def _redetect_current(self) -> None:
         if not (0 <= self._current < len(self._states)):
             return
@@ -757,19 +1009,87 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _apply_masking(frame: np.ndarray, faces: List[FaceBox], params: ImageParams) -> None:
-        for i, face in enumerate(faces):
-            x1, y1, x2, y2 = scale_bb(face.x1, face.y1, face.x2, face.y2, params.mask_scale)
-            y1 = max(0, int(y1)); y2 = min(frame.shape[0], int(y2))
-            x1 = max(0, int(x1)); x2 = min(frame.shape[1], int(x2))
-            if x2 <= x1 or y2 <= y1:
+        if params.replacewith == "none":
+            return
+        H, W = frame.shape[:2]
+        feather = max(0, int(params.feather))
+        opacity = max(0, min(100, int(params.opacity))) / 100.0
+        if opacity <= 0.0:
+            return
+        shape = params.shape if params.shape in SHAPES else DEFAULT_SHAPE
+        for face in faces:
+            ex1, ey1, ex2, ey2 = scale_bb(face.x1, face.y1, face.x2, face.y2, params.mask_scale)
+            ex1, ey1, ex2, ey2 = int(ex1), int(ey1), int(ex2), int(ey2)
+            if ex2 <= ex1 or ey2 <= ey1:
                 continue
-            draw_det(
-                frame, face.score, i, x1, y1, x2, y2,
-                replacewith=params.replacewith,
-                ellipse=True,
-                draw_scores=False,
-                mosaicsize=params.mosaic_size,
-            )
+            # 给羽化留 padding,避免软边被 ROI 边界截断
+            pad = max(2, feather * 2)
+            rx1 = max(0, ex1 - pad); ry1 = max(0, ey1 - pad)
+            rx2 = min(W, ex2 + pad); ry2 = min(H, ey2 + pad)
+            if rx2 - rx1 <= 0 or ry2 - ry1 <= 0:
+                continue
+            roi = frame[ry1:ry2, rx1:rx2]
+            rh, rw = roi.shape[:2]
+
+            # 形状中心 + 半轴(ROI 坐标系)
+            cx = (ex1 + ex2) / 2.0 - rx1
+            cy = (ey1 + ey2) / 2.0 - ry1
+            ax = max(1.0, (ex2 - ex1) / 2.0)
+            ay = max(1.0, (ey2 - ey1) / 2.0)
+
+            if shape == "rect":
+                mask = np.zeros((rh, rw), dtype=np.float32)
+                bx1 = max(0, int(round(cx - ax))); bx2 = min(rw, int(round(cx + ax)))
+                by1 = max(0, int(round(cy - ay))); by2 = min(rh, int(round(cy + ay)))
+                mask[by1:by2, bx1:bx2] = 1.0
+            else:  # ellipse
+                yy, xx = np.ogrid[:rh, :rw]
+                mask = (((xx - cx) / ax) ** 2 + ((yy - cy) / ay) ** 2 <= 1.0).astype(np.float32)
+
+            if feather > 0:
+                mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=float(feather), sigmaY=float(feather))
+                mask = np.clip(mask, 0.0, 1.0)
+            # 半透明:整体降低 mask 强度,让底色透出来
+            if opacity < 1.0:
+                mask = mask * opacity
+            if mask.ndim == 2:
+                mask = mask[..., None]
+
+            # 按打码方式生成被替换的内容(整 ROI 大小)
+            mode = params.replacewith
+            if mode == "blur":
+                # blur factor 2(同 upstream),核大小相对于人脸尺寸
+                bf = 2
+                kw = max(1, int((ex2 - ex1) / bf))
+                kh = max(1, int((ey2 - ey1) / bf))
+                replaced = cv2.blur(roi, (kw, kh))
+            elif mode == "frosted":
+                # 磨砂玻璃:强模糊 + 浅白雾化,看着比 blur 更"挡了一层东西"
+                bf = 3
+                kw = max(1, int((ex2 - ex1) / bf))
+                kh = max(1, int((ey2 - ey1) / bf))
+                blurred = cv2.blur(roi, (kw, kh)).astype(np.float32)
+                fog = np.full_like(roi, 235, dtype=np.float32)  # 浅灰白雾
+                replaced = (blurred * 0.7 + fog * 0.3).astype(np.uint8)
+            elif mode == "solid":
+                replaced = np.zeros_like(roi)
+            elif mode == "mosaic":
+                ms = max(2, int(params.mosaic_size))
+                replaced = roi.copy()
+                # 在 ROI 内对椭圆 bbox 区域打马赛克(roi 外区域不会显示因为 mask 为 0)
+                for y in range(0, rh, ms):
+                    for x in range(0, rw, ms):
+                        y2b = min(rh, y + ms); x2b = min(rw, x + ms)
+                        block = roi[y:y2b, x:x2b]
+                        if block.size == 0:
+                            continue
+                        avg = block.reshape(-1, block.shape[-1]).mean(axis=0)
+                        replaced[y:y2b, x:x2b] = avg.astype(np.uint8)
+            else:
+                continue
+
+            blended = roi * (1.0 - mask) + replaced * mask
+            frame[ry1:ry2, rx1:rx2] = blended.astype(np.uint8)
 
 
 # ---------- helpers ----------

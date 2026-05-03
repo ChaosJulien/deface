@@ -5,7 +5,7 @@
 #   pyinstaller deface_gui.spec --clean
 
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, copy_metadata
 
 block_cipher = None
 
@@ -20,6 +20,15 @@ datas = [
 ]
 datas += collect_data_files('imageio_ffmpeg')   # bundle ffmpeg.exe
 datas += collect_data_files('onnxruntime')
+
+# 一些包启动会调 importlib.metadata.version(self),PyInstaller 默认不带 metadata。
+# 不带的话报 PackageNotFoundError。
+for pkg in ('imageio', 'imageio_ffmpeg', 'numpy', 'pillow', 'onnxruntime',
+            'opencv-python', 'pyside6', 'pytesseract', 'tqdm', 'scikit-image'):
+    try:
+        datas += copy_metadata(pkg)
+    except Exception as e:
+        print(f"[spec] copy_metadata({pkg!r}) skipped: {e}")
 
 # 可选:打包 vendor/tesseract/ 进 exe(关键词 OCR 在 Windows 上能用)
 binaries = []

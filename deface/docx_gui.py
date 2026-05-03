@@ -799,7 +799,30 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([260, 880, 300])
-        self.setCentralWidget(splitter)
+
+        # 中央容器:splitter + 底部进度条(进度条单独一条 strip,
+        # 不挂 QStatusBar —— macOS 26 + Qt 6.11 把 widget addPermanentWidget 进
+        # status bar 会让 macStyle 在 paintEvent 里 NSAppearance 段错误)
+        central = QtWidgets.QWidget()
+        cv = QtWidgets.QVBoxLayout(central)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+        cv.addWidget(splitter, 1)
+
+        self._export_strip = QtWidgets.QWidget()
+        self._export_strip.setVisible(False)
+        es = QtWidgets.QHBoxLayout(self._export_strip)
+        es.setContentsMargins(10, 4, 10, 4)
+        self._export_label = QtWidgets.QLabel("")
+        self._export_label.setStyleSheet("color:#444;")
+        self._export_pbar = QtWidgets.QProgressBar()
+        self._export_pbar.setMaximumHeight(14)
+        self._export_pbar.setTextVisible(True)
+        es.addWidget(self._export_label, 1)
+        es.addWidget(self._export_pbar, 2)
+        cv.addWidget(self._export_strip)
+
+        self.setCentralWidget(central)
 
         self._build_toolbar()
         self.status = self.statusBar()
@@ -1155,19 +1178,12 @@ class MainWindow(QtWidgets.QMainWindow):
             jobs.append((st, to_mask))
         total = max(1, len(jobs))
 
-        # PySide6 6.11 + macOS 下 QProgressDialog 跟主事件循环冲突,会触发 recursive
-        # repaint 段错误。改用状态栏 + 永久 QProgressBar,非模态,不会卡住主循环。
-        if not hasattr(self, "_export_pbar") or self._export_pbar is None:
-            self._export_pbar = QtWidgets.QProgressBar()
-            self._export_pbar.setMaximumWidth(220)
-            self._export_pbar.setMaximumHeight(16)
-            self._export_pbar.setTextVisible(True)
-            self.status.addPermanentWidget(self._export_pbar)
+        # 用底部 export_strip(独立 QWidget),不要碰 QStatusBar(macOS 26 段错误雷区)
         self._export_pbar.setRange(0, total + 1)
         self._export_pbar.setValue(0)
-        self._export_pbar.setFormat("导出 0/%m")
-        self._export_pbar.show()
-        self.status.showMessage(f"导出 → {out_path.name}")
+        self._export_pbar.setFormat("%v / %m")
+        self._export_label.setText(f"导出 → {out_path.name}")
+        self._export_strip.setVisible(True)
 
         thread = QtCore.QThread(self)
         worker = ExportWorker(jobs, self._docx_path, out_path)
@@ -1180,8 +1196,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def on_progress(done: int, tot: int, msg: str) -> None:
             self._export_pbar.setRange(0, tot + 1)
             self._export_pbar.setValue(done)
-            self._export_pbar.setFormat(f"{done}/{tot}")
-            self.status.showMessage(msg, 0)
+            self._export_label.setText(msg)
 
         def cleanup() -> None:
             thread.quit()
@@ -1189,7 +1204,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._export_thread = None
             self._export_worker = None
             self._act_export.setEnabled(True)
-            self._export_pbar.hide()
+            self._export_strip.setVisible(False)
 
         def on_ok(p: str, count: int) -> None:
             cleanup()

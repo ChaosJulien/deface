@@ -4,6 +4,9 @@
 # Windows build venv
 .venv-win/
 
+# vendored binaries pulled in by build scripts (tesseract.exe + DLLs + traineddata)
+vendor/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -1,8 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Windows GUI build (CPU only). Run on Windows:
-#   pip install -e . pyside6 onnxruntime pillow pyinstaller
+#   pip install -e . pyside6 onnxruntime pillow pytesseract pyinstaller
+#   # 准备 vendor/tesseract/(tesseract.exe + *.dll + tessdata/*.traineddata)
 #   pyinstaller deface_gui.spec --clean
 
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 block_cipher = None
@@ -19,10 +21,26 @@ datas = [
 datas += collect_data_files('imageio_ffmpeg')   # bundle ffmpeg.exe
 datas += collect_data_files('onnxruntime')
 
+# 可选:打包 vendor/tesseract/ 进 exe(关键词 OCR 在 Windows 上能用)
+binaries = []
+vendor_tess = Path('vendor/tesseract')
+if vendor_tess.is_dir():
+    for p in vendor_tess.glob('*.exe'):
+        binaries.append((str(p), 'tesseract'))
+    for p in vendor_tess.glob('*.dll'):
+        binaries.append((str(p), 'tesseract'))
+    tessdata = vendor_tess / 'tessdata'
+    if tessdata.is_dir():
+        for p in tessdata.glob('*.traineddata'):
+            datas.append((str(p), 'tesseract/tessdata'))
+    print(f"[spec] vendored tesseract: {len(binaries)} bin, {sum(1 for _ in tessdata.glob('*.traineddata')) if tessdata.is_dir() else 0} traineddata")
+else:
+    print("[spec] vendor/tesseract/ not found — built exe will lack OCR. Install tesseract on target machine or rerun build with vendor populated.")
+
 a = Analysis(
     ['deface/docx_gui.py'],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

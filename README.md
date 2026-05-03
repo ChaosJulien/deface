@@ -12,20 +12,32 @@ Original | After (`deface examples/city.jpg`)
 
 - **Open Office / ODF documents** — `.docx` `.docm` `.dotx` / `.pptx` `.pptm` `.potx` / `.xlsx` `.xlsm` `.xltx` / `.odt` `.odp` `.ods`. Embedded images extracted from the right zip prefix (`word/media/`, `ppt/media/`, `xl/media/`, `Pictures/`, plus `*/embeddings/`).
 - **YuNet face detection** via OpenCV's `cv2.FaceDetectorYN` — more accurate than upstream's CenterFace on still images, and won't OOM on huge inputs.
+- **Five replace modes**: `blur` · `frosted` (blur + light fog, more obviously "covered") · `solid` (black) · `mosaic` · `none` (boxes only).
+- **Mask shape / feather / opacity** — pick `ellipse` or `rect`, soften edges with a Gaussian feather radius, dial overall mask strength down to let the original peek through.
+- **Keyword OCR redaction** — paste keywords (one per line), the GUI scans every image and adds boxes around matching text so you can mask it just like a face. Backends: macOS Vision (`ocrmac`, native, no extra binary) and **cross-platform Tesseract** (chi_sim + eng bundled in the Windows release).
 - **Per-image manual review:**
-  - 🔴 red box = will be blurred
-  - 🟢 green box = kept (flip misdetections with a click)
+  - 🔴 red box = will be masked · 🟢 green = kept · 🟡/🔵 = OCR text matches (mask / keep)
   - left-click toggles, right-click deletes
   - **Manual box drawing** for missed faces — drag a rectangle, generates a red `manual=True` box that survives re-detection.
 - **Threshold slider** with 350 ms debounce. Current image is re-detected automatically; old red/green flags are reused via IoU when boxes overlap.
 - **`Up/Down` or `J/K` navigation** between images, focus-independent.
-- **Export** writes a new file:
+- **Export** writes a new file with a non-blocking progress dialog (no more "not responding"):
   - Only modified images are re-encoded — everything else (`document.xml`, relationships, styles, slides, sheets) is byte-passthrough, so the result opens cleanly in Word / PowerPoint / Excel / LibreOffice.
   - Output extension matches input automatically.
-- **PIL `convert("RGB")`** decoding — CMYK / RGBA / palette PNGs no longer come back inverted.
+- **Transparent PNG safe** — alpha channel is preserved on load and re-attached on encode, so PNGs with transparency no longer export with a black background.
 - **Per-extension encoding** — `.jpg/.bmp/.gif` forced to RGB (drop alpha), `.png/.tif/.webp` keep alpha. JPEG no longer crashes on alpha-bearing inputs.
 
-## 🚀 Install
+## 📥 Windows one-click bundle
+
+Don't want to install Python? Grab a self-contained bundle from CI:
+
+1. Open the [`build-windows-gui` workflow](https://github.com/ChaosJulien/deface/actions/workflows/build-windows-gui.yml) and click the latest successful run.
+2. Scroll to **Artifacts** → download `deface_gui-windows-x64`.
+3. Unzip → double-click `deface_gui.exe`. Bundled with Qt, onnxruntime (CPU), and Tesseract + `chi_sim`/`eng` data — the target machine needs nothing pre-installed.
+
+> Downloading from Actions requires being signed in to GitHub. Tagged Releases will be added later for anonymous downloads.
+
+## 🚀 Install (from source)
 
 Requires **Python 3.10+** (tested on 3.14). Use a venv:
 
@@ -36,10 +48,13 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
 pip install -e .
-pip install PySide6 onnxruntime imageio Pillow
+pip install PySide6 onnxruntime imageio Pillow pytesseract
+# macOS only, for Apple Vision OCR (faster + zero deps): pip install ocrmac
 ```
 
 The YuNet model (`face_detection_yunet_2023mar.onnx`, 228 KB) is committed to this repo — no extra download needed.
+
+For the OCR keyword feature: macOS uses `ocrmac` (Apple Vision, install separately). Linux / Windows source installs need Tesseract installed system-wide (`brew install tesseract` / `apt install tesseract-ocr` / [UB-Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki)). The Windows bundle above already ships with Tesseract.
 
 ## 🖱 Using the GUI
 
@@ -72,8 +87,11 @@ Workflow:
 
 | Param | Default | Meaning |
 |---|---|---|
-| Replace mode | `blur` | Gaussian blur. Also: `solid` (black box), `mosaic`, `none` (boxes only) |
+| Replace mode | `blur` | `blur` · `frosted` (blur + light fog) · `solid` (black box) · `mosaic` · `none` (boxes only) |
+| Shape | `ellipse` | Mask shape. `rect` for hard rectangles |
 | Mask scale | `1.30` | Expand mask by 30% to cover hair / chin |
+| Feather | `0` | Gaussian feather radius (px). `0` = hard edge |
+| Opacity | `100` | Mask strength (%). `<100` lets the original image bleed through |
 | Mosaic size | `20` | Only when mode = mosaic |
 | Detection threshold | `0.50` | YuNet score; higher = stricter (more misses, fewer false positives) |
 
@@ -86,10 +104,11 @@ Workflow:
 ## 🔬 How it works
 
 1. **Parse OOXML / ODF** (zip): pull all `.png/.jpg/.jpeg/.bmp/.gif/.tif/.webp` from `word/media`, `ppt/media`, `xl/media`, `*/embeddings`, `Pictures/`.
-2. **Decode**: PIL `Image.open + convert("RGB")` normalizes CMYK / RGBA / palette / grayscale into 3-channel RGB to avoid color inversion.
+2. **Decode**: PIL `Image.open` → 3-channel RGB for detection. RGBA / `LA` / palette-with-transparency: alpha is split off and stored separately so it can be re-attached on encode (transparent PNGs no longer flatten to a black background).
 3. **Detect**: YuNet (`cv2.FaceDetectorYN`) on BGR. Large images are `cv2.resize`'d to long edge 1280; results are scaled back to original coordinates.
-4. **Anonymize**: reuses upstream's `draw_det` (ellipse mask + Gaussian / mosaic / solid).
-5. **Repack**: `zipfile` rewrites the container, modified images go through `zout.writestr`, every other entry is byte-pass-through via `ZipInfo`.
+4. **OCR (optional)**: keyword scan via `ocrmac` (macOS) or `pytesseract` (cross-platform). Word-level boxes are aggregated by line, then matched both space-joined and concatenated for CJK + Latin coverage.
+5. **Anonymize**: ellipse / rectangle mask with optional Gaussian feather + per-image opacity, blended into the original ROI. Modes: blur, frosted (blur + fog), mosaic, solid.
+6. **Repack**: a background `QThread` runs masking + encoding + zip rewrite while a progress dialog updates. Modified images go through `zout.writestr`; every other entry is byte-pass-through via `ZipInfo`.
 
 ## 🖥 Upstream CLI
 

@@ -692,7 +692,7 @@ class OCRPanel(QtWidgets.QWidget):
         layout.addLayout(btns)
 
         tip = QtWidgets.QLabel(
-            "黄=会被打码,蓝=保留;点击切换,右键删除。"
+            "黄=会被打码,蓝=保留;点击切换,右键删除。\n关键词自动保存,下次启动还在。"
         )
         tip.setStyleSheet("color:#888; font-size:11px;")
         tip.setWordWrap(True)
@@ -701,12 +701,29 @@ class OCRPanel(QtWidgets.QWidget):
         self.scan_btn.clicked.connect(self._on_scan)
         self.clear_btn.clicked.connect(self.clear_clicked)
 
+        # ---- 关键词自动保存/恢复(QSettings),崩了重启不丢 ----
+        self._settings = QtCore.QSettings("ChaosJulien", "deface_gui")
+        saved = self._settings.value("ocr/keywords", "", type=str)
+        if saved:
+            self.keywords_input.setPlainText(saved)
+        # 防抖 500ms,避免每按一键都写盘
+        self._save_timer = QtCore.QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self._persist_keywords)
+        self.keywords_input.textChanged.connect(self._save_timer.start)
+
+    def _persist_keywords(self) -> None:
+        self._settings.setValue("ocr/keywords", self.keywords_input.toPlainText())
+
     def _on_scan(self) -> None:
         text = self.keywords_input.toPlainText()
         kws = [line.strip() for line in text.splitlines() if line.strip()]
         if not kws:
             QtWidgets.QMessageBox.information(self, "无关键词", "请先在文本框里输入关键词,每行一个。")
             return
+        # 扫描前强制落盘,以防崩在扫描或导出阶段
+        self._persist_keywords()
         self.scan_clicked.emit(kws)
 
 
@@ -1168,9 +1185,12 @@ class MainWindow(QtWidgets.QMainWindow):
             cleanup()
             QtWidgets.QMessageBox.critical(self, "导出失败", msg)
 
-        worker.progress.connect(on_progress)
-        worker.finished_ok.connect(on_ok)
-        worker.failed.connect(on_failed)
+        # 闭包不是 QObject,默认会被 Qt 判成 DirectConnection → 在 worker 线程里跑,
+        # 一调 dlg.setValue 触发 QTimer 就炸「Timers cannot be started from another thread」。
+        # 强制 QueuedConnection,槽走主线程事件循环。
+        worker.progress.connect(on_progress, QtCore.Qt.QueuedConnection)
+        worker.finished_ok.connect(on_ok, QtCore.Qt.QueuedConnection)
+        worker.failed.connect(on_failed, QtCore.Qt.QueuedConnection)
 
         self._act_export.setEnabled(False)
         thread.start()

@@ -114,7 +114,8 @@ class ImageState:
     arcname: str
     data: bytes
     suffix: str
-    frame: Optional[np.ndarray] = None  # 解码后的 RGB
+    frame: Optional[np.ndarray] = None  # 解码后的 RGB(始终 3 通道,方便 detect / mask)
+    alpha: Optional[np.ndarray] = None  # 原图 alpha 通道(2D uint8),无透明度则 None
     faces: List[FaceBox] = field(default_factory=list)
     params: ImageParams = field(default_factory=ImageParams)
     detected: bool = False
@@ -865,11 +866,23 @@ class MainWindow(QtWidgets.QMainWindow):
         for img in images:
             st = ImageState(arcname=img.arcname, data=img.data, suffix=img.suffix)
             try:
-                # 用 PIL 统一解到 3 通道 RGB:CMYK 不会反色、RGBA/P/L 也都正确转换
+                # 透明 PNG / palette+transparency / LA:抽出 alpha 单独存,导出时再拼回。
+                # 之前直接 convert("RGB") 会把透明区合成到黑底,导出永久变黑底 → 这里修。
                 im = PilImage.open(io.BytesIO(img.data))
-                if im.mode != "RGB":
-                    im = im.convert("RGB")
-                st.frame = np.array(im, dtype=np.uint8)
+                if im.mode == "P" and "transparency" in im.info:
+                    im = im.convert("RGBA")
+                if im.mode == "RGBA":
+                    arr = np.array(im, dtype=np.uint8)
+                    st.alpha = arr[..., 3].copy()
+                    st.frame = arr[..., :3].copy()
+                elif im.mode == "LA":
+                    arr = np.array(im, dtype=np.uint8)
+                    st.alpha = arr[..., 1].copy()
+                    st.frame = np.repeat(arr[..., :1], 3, axis=2)
+                else:
+                    if im.mode != "RGB":
+                        im = im.convert("RGB")
+                    st.frame = np.array(im, dtype=np.uint8)
             except Exception as exc:  # noqa: BLE001
                 st.error = f"解码失败: {exc}"
             self._states.append(st)
@@ -1276,7 +1289,7 @@ class ExportWorker(QtCore.QObject):
                 self.progress.emit(i - 1, total, f"打码 {i}/{len(self._jobs)}:{st.arcname}")
                 frame = st.frame.copy()
                 _apply_masking_impl(frame, to_mask, st.params)
-                replacements[st.arcname] = _encode_image(frame, st.suffix)
+                replacements[st.arcname] = _encode_image(frame, st.suffix, alpha=st.alpha)
             self.progress.emit(len(self._jobs), total, f"写入 {self._out.name} …")
             write_docx(self._src, self._out, replacements)
             self.progress.emit(total, total, "完成")
@@ -1311,12 +1324,12 @@ _EXT_TO_PIL = {
 }
 
 
-def _encode_image(frame: np.ndarray, suffix: str) -> bytes:
+def _encode_image(frame: np.ndarray, suffix: str, alpha: Optional[np.ndarray] = None) -> bytes:
     """把 numpy 数组编码为指定后缀的图片字节。
 
     JPEG 不支持 alpha,PIL 直接写 4 通道会炸。这里按 ext 强制转 mode:
     - JPEG/BMP/GIF 一律 RGB(去 alpha)
-    - PNG/TIFF/WEBP 透传(支持 alpha)
+    - PNG/TIFF/WEBP 透传(支持 alpha);若提供 alpha 数组,合到 RGBA 输出
     """
     suffix = suffix.lower()
     fmt, force_mode = _EXT_TO_PIL.get(suffix, ("PNG", None))
@@ -1333,6 +1346,16 @@ def _encode_image(frame: np.ndarray, suffix: str) -> bytes:
         im = PilImage.fromarray(arr, mode="RGB")
     else:
         im = PilImage.fromarray(arr[:, :, :3], mode="RGB")
+
+    # 目标支持 alpha 且我们有原 alpha → 拼回去,避免透明 PNG 导出变黑底
+    supports_alpha = force_mode is None and fmt in ("PNG", "TIFF", "WEBP")
+    if supports_alpha and alpha is not None and im.mode == "RGB":
+        a = alpha
+        if a.dtype != np.uint8:
+            a = a.astype(np.uint8)
+        if a.shape[:2] == arr.shape[:2]:
+            rgba = np.dstack([arr, a])
+            im = PilImage.fromarray(rgba, mode="RGBA")
 
     if force_mode is not None and im.mode != force_mode:
         im = im.convert(force_mode)

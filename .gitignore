@@ -1,3 +1,9 @@
+# macOS / IDE
+.DS_Store
+
+# Windows build venv
+.venv-win/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

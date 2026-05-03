@@ -1,0 +1,43 @@
+name: build-windows-gui
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # setuptools-scm 需要 tag 历史
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyside6 onnxruntime pillow pyinstaller
+
+      - name: Build
+        run: pyinstaller deface_gui.spec --clean --noconfirm
+
+      - name: Zip artifact
+        run: Compress-Archive -Path dist\deface_gui\* -DestinationPath deface_gui-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deface_gui-windows-x64
+          path: deface_gui-windows-x64.zip
+          retention-days: 30
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: deface_gui-windows-x64.zip

@@ -703,15 +703,23 @@ class OCRPanel(QtWidgets.QWidget):
 
         # ---- 关键词自动保存/恢复(QSettings),崩了重启不丢 ----
         self._settings = QtCore.QSettings("ChaosJulien", "deface_gui")
-        saved = self._settings.value("ocr/keywords", "", type=str)
-        if saved:
-            self.keywords_input.setPlainText(saved)
         # 防抖 500ms,避免每按一键都写盘
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(500)
         self._save_timer.timeout.connect(self._persist_keywords)
         self.keywords_input.textChanged.connect(self._save_timer.start)
+        # 恢复要等首次事件循环结束、widget 完成 layout,否则会触发 recursive repaint 段错误
+        QtCore.QTimer.singleShot(0, self._restore_saved)
+
+    def _restore_saved(self) -> None:
+        saved = self._settings.value("ocr/keywords", "", type=str)
+        if not saved:
+            return
+        # blockSignals 防 setPlainText 触发 textChanged → 立刻又写盘一次(无意义且引起回环)
+        self.keywords_input.blockSignals(True)
+        self.keywords_input.setPlainText(saved)
+        self.keywords_input.blockSignals(False)
 
     def _persist_keywords(self) -> None:
         self._settings.setValue("ocr/keywords", self.keywords_input.toPlainText())
@@ -1147,13 +1155,19 @@ class MainWindow(QtWidgets.QMainWindow):
             jobs.append((st, to_mask))
         total = max(1, len(jobs))
 
-        dlg = QtWidgets.QProgressDialog("准备中…", "", 0, total + 1, self)
-        dlg.setWindowTitle("导出中")
-        dlg.setWindowModality(QtCore.Qt.WindowModal)
-        dlg.setMinimumDuration(0)
-        dlg.setAutoClose(False)
-        dlg.setAutoReset(False)
-        dlg.setCancelButton(None)   # 取消打到一半会损坏输出 zip,直接禁掉
+        # PySide6 6.11 + macOS 下 QProgressDialog 跟主事件循环冲突,会触发 recursive
+        # repaint 段错误。改用状态栏 + 永久 QProgressBar,非模态,不会卡住主循环。
+        if not hasattr(self, "_export_pbar") or self._export_pbar is None:
+            self._export_pbar = QtWidgets.QProgressBar()
+            self._export_pbar.setMaximumWidth(220)
+            self._export_pbar.setMaximumHeight(16)
+            self._export_pbar.setTextVisible(True)
+            self.status.addPermanentWidget(self._export_pbar)
+        self._export_pbar.setRange(0, total + 1)
+        self._export_pbar.setValue(0)
+        self._export_pbar.setFormat("导出 0/%m")
+        self._export_pbar.show()
+        self.status.showMessage(f"导出 → {out_path.name}")
 
         thread = QtCore.QThread(self)
         worker = ExportWorker(jobs, self._docx_path, out_path)
@@ -1164,29 +1178,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._export_worker = worker
 
         def on_progress(done: int, tot: int, msg: str) -> None:
-            dlg.setMaximum(tot + 1)
-            dlg.setValue(done)
-            dlg.setLabelText(msg)
+            self._export_pbar.setRange(0, tot + 1)
+            self._export_pbar.setValue(done)
+            self._export_pbar.setFormat(f"{done}/{tot}")
+            self.status.showMessage(msg, 0)
 
         def cleanup() -> None:
-            dlg.close()
             thread.quit()
             thread.wait()
             self._export_thread = None
             self._export_worker = None
             self._act_export.setEnabled(True)
+            self._export_pbar.hide()
 
         def on_ok(p: str, count: int) -> None:
             cleanup()
-            QtWidgets.QMessageBox.information(self, "完成", f"导出完成:\n{p}\n\n替换图片 {count} 张。")
-            self.status.showMessage(f"导出到 {p}")
+            self.status.showMessage(f"✅ 导出完成 → {p}(共 {count} 张)", 10000)
+            # MessageBox 推迟到下一轮事件循环,避免在 worker thread 退出的同一 tick 弹窗
+            QtCore.QTimer.singleShot(
+                50,
+                lambda: QtWidgets.QMessageBox.information(
+                    self, "完成", f"导出完成:\n{p}\n\n替换图片 {count} 张。"
+                ),
+            )
 
         def on_failed(msg: str) -> None:
             cleanup()
-            QtWidgets.QMessageBox.critical(self, "导出失败", msg)
+            self.status.showMessage("❌ 导出失败", 10000)
+            QtCore.QTimer.singleShot(
+                50, lambda: QtWidgets.QMessageBox.critical(self, "导出失败", msg)
+            )
 
         # 闭包不是 QObject,默认会被 Qt 判成 DirectConnection → 在 worker 线程里跑,
-        # 一调 dlg.setValue 触发 QTimer 就炸「Timers cannot be started from another thread」。
+        # 一调 widget setter 触发内部 QTimer 就炸「Timers cannot be started from another thread」。
         # 强制 QueuedConnection,槽走主线程事件循环。
         worker.progress.connect(on_progress, QtCore.Qt.QueuedConnection)
         worker.finished_ok.connect(on_ok, QtCore.Qt.QueuedConnection)
@@ -1194,7 +1218,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._act_export.setEnabled(False)
         thread.start()
-        dlg.show()
 
     @staticmethod
     def _apply_masking(frame: np.ndarray, faces: List[FaceBox], params: ImageParams) -> None:

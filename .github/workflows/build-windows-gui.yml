@@ -45,14 +45,18 @@ jobs:
       - name: Build
         run: pyinstaller deface_gui.spec --clean --noconfirm
 
-      - name: Zip artifact
-        run: Compress-Archive -Path dist\deface_gui\* -DestinationPath deface_gui-windows-x64.zip
-
+      # 直接上传文件夹 — actions/upload-artifact 会包一次 zip,gh run download 解压后就是
+      # deface_gui-windows-x64/{deface_gui.exe, _internal/...},不再有双层 zip
       - uses: actions/upload-artifact@v4
         with:
           name: deface_gui-windows-x64
-          path: deface_gui-windows-x64.zip
+          path: dist/deface_gui/
           retention-days: 30
+
+      # release 用单独 zip(softprops 需要文件,不能上传文件夹)
+      - name: Zip for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: Compress-Archive -Path dist\deface_gui\* -DestinationPath deface_gui-windows-x64.zip
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')

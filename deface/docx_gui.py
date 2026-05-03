@@ -1105,118 +1105,184 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         out_path = Path(path)
-        try:
-            replacements = self._build_replacements()
-            write_docx(self._docx_path, out_path, replacements)
-        except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(
-                self, "导出失败",
-                f"{exc}\n\n{traceback.format_exc()}",
-            )
-            return
-        QtWidgets.QMessageBox.information(
-            self, "完成",
-            f"导出完成:\n{out_path}\n\n替换图片 {len(replacements)} 张。"
-        )
-        self.status.showMessage(f"导出到 {out_path}")
 
-    def _build_replacements(self) -> dict[str, bytes]:
-        """对每张有要打码的图,跑掉非 keep 的脸,编码回原格式。无脸或全 keep 的图跳过(原图保留)。"""
-        replacements: dict[str, bytes] = {}
+        # 把要打码的图片预筛一遍 → 估总进度
+        jobs = []
         for st in self._states:
             if st.frame is None or not st.faces:
                 continue
             to_mask = [f for f in st.faces if not f.keep]
             if not to_mask:
                 continue
-            frame = st.frame.copy()
-            self._apply_masking(frame, to_mask, st.params)
-            replacements[st.arcname] = _encode_image(frame, st.suffix)
-        return replacements
+            jobs.append((st, to_mask))
+        total = max(1, len(jobs))
+
+        dlg = QtWidgets.QProgressDialog("准备中…", "", 0, total + 1, self)
+        dlg.setWindowTitle("导出中")
+        dlg.setWindowModality(QtCore.Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setCancelButton(None)   # 取消打到一半会损坏输出 zip,直接禁掉
+
+        thread = QtCore.QThread(self)
+        worker = ExportWorker(jobs, self._docx_path, out_path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        # 持引用避免 GC
+        self._export_thread = thread
+        self._export_worker = worker
+
+        def on_progress(done: int, tot: int, msg: str) -> None:
+            dlg.setMaximum(tot + 1)
+            dlg.setValue(done)
+            dlg.setLabelText(msg)
+
+        def cleanup() -> None:
+            dlg.close()
+            thread.quit()
+            thread.wait()
+            self._export_thread = None
+            self._export_worker = None
+            self._act_export.setEnabled(True)
+
+        def on_ok(p: str, count: int) -> None:
+            cleanup()
+            QtWidgets.QMessageBox.information(self, "完成", f"导出完成:\n{p}\n\n替换图片 {count} 张。")
+            self.status.showMessage(f"导出到 {p}")
+
+        def on_failed(msg: str) -> None:
+            cleanup()
+            QtWidgets.QMessageBox.critical(self, "导出失败", msg)
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_ok)
+        worker.failed.connect(on_failed)
+
+        self._act_export.setEnabled(False)
+        thread.start()
+        dlg.show()
 
     @staticmethod
     def _apply_masking(frame: np.ndarray, faces: List[FaceBox], params: ImageParams) -> None:
-        if params.replacewith == "none":
-            return
-        H, W = frame.shape[:2]
-        feather = max(0, int(params.feather))
-        opacity = max(0, min(100, int(params.opacity))) / 100.0
-        if opacity <= 0.0:
-            return
-        shape = params.shape if params.shape in SHAPES else DEFAULT_SHAPE
-        for face in faces:
-            ex1, ey1, ex2, ey2 = scale_bb(face.x1, face.y1, face.x2, face.y2, params.mask_scale)
-            ex1, ey1, ex2, ey2 = int(ex1), int(ey1), int(ex2), int(ey2)
-            if ex2 <= ex1 or ey2 <= ey1:
-                continue
-            # 给羽化留 padding,避免软边被 ROI 边界截断
-            pad = max(2, feather * 2)
-            rx1 = max(0, ex1 - pad); ry1 = max(0, ey1 - pad)
-            rx2 = min(W, ex2 + pad); ry2 = min(H, ey2 + pad)
-            if rx2 - rx1 <= 0 or ry2 - ry1 <= 0:
-                continue
-            roi = frame[ry1:ry2, rx1:rx2]
-            rh, rw = roi.shape[:2]
+        _apply_masking_impl(frame, faces, params)
 
-            # 形状中心 + 半轴(ROI 坐标系)
-            cx = (ex1 + ex2) / 2.0 - rx1
-            cy = (ey1 + ey2) / 2.0 - ry1
-            ax = max(1.0, (ex2 - ex1) / 2.0)
-            ay = max(1.0, (ey2 - ey1) / 2.0)
 
-            if shape == "rect":
-                mask = np.zeros((rh, rw), dtype=np.float32)
-                bx1 = max(0, int(round(cx - ax))); bx2 = min(rw, int(round(cx + ax)))
-                by1 = max(0, int(round(cy - ay))); by2 = min(rh, int(round(cy + ay)))
-                mask[by1:by2, bx1:bx2] = 1.0
-            else:  # ellipse
-                yy, xx = np.ogrid[:rh, :rw]
-                mask = (((xx - cx) / ax) ** 2 + ((yy - cy) / ay) ** 2 <= 1.0).astype(np.float32)
+def _apply_masking_impl(frame: np.ndarray, faces: List[FaceBox], params: ImageParams) -> None:
+    """模块级版本,worker 线程也能调。"""
+    if params.replacewith == "none":
+        return
+    H, W = frame.shape[:2]
+    feather = max(0, int(params.feather))
+    opacity = max(0, min(100, int(params.opacity))) / 100.0
+    if opacity <= 0.0:
+        return
+    shape = params.shape if params.shape in SHAPES else DEFAULT_SHAPE
+    for face in faces:
+        ex1, ey1, ex2, ey2 = scale_bb(face.x1, face.y1, face.x2, face.y2, params.mask_scale)
+        ex1, ey1, ex2, ey2 = int(ex1), int(ey1), int(ex2), int(ey2)
+        if ex2 <= ex1 or ey2 <= ey1:
+            continue
+        # 给羽化留 padding,避免软边被 ROI 边界截断
+        pad = max(2, feather * 2)
+        rx1 = max(0, ex1 - pad); ry1 = max(0, ey1 - pad)
+        rx2 = min(W, ex2 + pad); ry2 = min(H, ey2 + pad)
+        if rx2 - rx1 <= 0 or ry2 - ry1 <= 0:
+            continue
+        roi = frame[ry1:ry2, rx1:rx2]
+        rh, rw = roi.shape[:2]
 
-            if feather > 0:
-                mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=float(feather), sigmaY=float(feather))
-                mask = np.clip(mask, 0.0, 1.0)
-            # 半透明:整体降低 mask 强度,让底色透出来
-            if opacity < 1.0:
-                mask = mask * opacity
-            if mask.ndim == 2:
-                mask = mask[..., None]
+        # 形状中心 + 半轴(ROI 坐标系)
+        cx = (ex1 + ex2) / 2.0 - rx1
+        cy = (ey1 + ey2) / 2.0 - ry1
+        ax = max(1.0, (ex2 - ex1) / 2.0)
+        ay = max(1.0, (ey2 - ey1) / 2.0)
 
-            # 按打码方式生成被替换的内容(整 ROI 大小)
-            mode = params.replacewith
-            if mode == "blur":
-                # blur factor 2(同 upstream),核大小相对于人脸尺寸
-                bf = 2
-                kw = max(1, int((ex2 - ex1) / bf))
-                kh = max(1, int((ey2 - ey1) / bf))
-                replaced = cv2.blur(roi, (kw, kh))
-            elif mode == "frosted":
-                # 磨砂玻璃:强模糊 + 浅白雾化,看着比 blur 更"挡了一层东西"
-                bf = 3
-                kw = max(1, int((ex2 - ex1) / bf))
-                kh = max(1, int((ey2 - ey1) / bf))
-                blurred = cv2.blur(roi, (kw, kh)).astype(np.float32)
-                fog = np.full_like(roi, 235, dtype=np.float32)  # 浅灰白雾
-                replaced = (blurred * 0.7 + fog * 0.3).astype(np.uint8)
-            elif mode == "solid":
-                replaced = np.zeros_like(roi)
-            elif mode == "mosaic":
-                ms = max(2, int(params.mosaic_size))
-                replaced = roi.copy()
-                # 在 ROI 内对椭圆 bbox 区域打马赛克(roi 外区域不会显示因为 mask 为 0)
-                for y in range(0, rh, ms):
-                    for x in range(0, rw, ms):
-                        y2b = min(rh, y + ms); x2b = min(rw, x + ms)
-                        block = roi[y:y2b, x:x2b]
-                        if block.size == 0:
-                            continue
-                        avg = block.reshape(-1, block.shape[-1]).mean(axis=0)
-                        replaced[y:y2b, x:x2b] = avg.astype(np.uint8)
-            else:
-                continue
+        if shape == "rect":
+            mask = np.zeros((rh, rw), dtype=np.float32)
+            bx1 = max(0, int(round(cx - ax))); bx2 = min(rw, int(round(cx + ax)))
+            by1 = max(0, int(round(cy - ay))); by2 = min(rh, int(round(cy + ay)))
+            mask[by1:by2, bx1:bx2] = 1.0
+        else:  # ellipse
+            yy, xx = np.ogrid[:rh, :rw]
+            mask = (((xx - cx) / ax) ** 2 + ((yy - cy) / ay) ** 2 <= 1.0).astype(np.float32)
 
-            blended = roi * (1.0 - mask) + replaced * mask
-            frame[ry1:ry2, rx1:rx2] = blended.astype(np.uint8)
+        if feather > 0:
+            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=float(feather), sigmaY=float(feather))
+            mask = np.clip(mask, 0.0, 1.0)
+        # 半透明:整体降低 mask 强度,让底色透出来
+        if opacity < 1.0:
+            mask = mask * opacity
+        if mask.ndim == 2:
+            mask = mask[..., None]
+
+        # 按打码方式生成被替换的内容(整 ROI 大小)
+        mode = params.replacewith
+        if mode == "blur":
+            # blur factor 2(同 upstream),核大小相对于人脸尺寸
+            bf = 2
+            kw = max(1, int((ex2 - ex1) / bf))
+            kh = max(1, int((ey2 - ey1) / bf))
+            replaced = cv2.blur(roi, (kw, kh))
+        elif mode == "frosted":
+            # 磨砂玻璃:强模糊 + 浅白雾化,看着比 blur 更"挡了一层东西"
+            bf = 3
+            kw = max(1, int((ex2 - ex1) / bf))
+            kh = max(1, int((ey2 - ey1) / bf))
+            blurred = cv2.blur(roi, (kw, kh)).astype(np.float32)
+            fog = np.full_like(roi, 235, dtype=np.float32)  # 浅灰白雾
+            replaced = (blurred * 0.7 + fog * 0.3).astype(np.uint8)
+        elif mode == "solid":
+            replaced = np.zeros_like(roi)
+        elif mode == "mosaic":
+            ms = max(2, int(params.mosaic_size))
+            replaced = roi.copy()
+            # 在 ROI 内对椭圆 bbox 区域打马赛克(roi 外区域不会显示因为 mask 为 0)
+            for y in range(0, rh, ms):
+                for x in range(0, rw, ms):
+                    y2b = min(rh, y + ms); x2b = min(rw, x + ms)
+                    block = roi[y:y2b, x:x2b]
+                    if block.size == 0:
+                        continue
+                    avg = block.reshape(-1, block.shape[-1]).mean(axis=0)
+                    replaced[y:y2b, x:x2b] = avg.astype(np.uint8)
+        else:
+            continue
+
+        blended = roi * (1.0 - mask) + replaced * mask
+        frame[ry1:ry2, rx1:rx2] = blended.astype(np.uint8)
+
+
+# ---------- 导出 worker(独立 QThread,避免 UI "未响应") ----------
+
+
+class ExportWorker(QtCore.QObject):
+    progress = QtCore.Signal(int, int, str)   # done, total, message
+    finished_ok = QtCore.Signal(str, int)     # out_path, count
+    failed = QtCore.Signal(str)
+
+    def __init__(self, jobs, src_path, out_path):
+        super().__init__()
+        self._jobs = jobs                # [(ImageState, [FaceBox to mask])]
+        self._src = Path(src_path)
+        self._out = Path(out_path)
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            replacements: dict[str, bytes] = {}
+            total = len(self._jobs) + 1   # +1 = 写入文档那一步
+            for i, (st, to_mask) in enumerate(self._jobs, 1):
+                self.progress.emit(i - 1, total, f"打码 {i}/{len(self._jobs)}:{st.arcname}")
+                frame = st.frame.copy()
+                _apply_masking_impl(frame, to_mask, st.params)
+                replacements[st.arcname] = _encode_image(frame, st.suffix)
+            self.progress.emit(len(self._jobs), total, f"写入 {self._out.name} …")
+            write_docx(self._src, self._out, replacements)
+            self.progress.emit(total, total, "完成")
+            self.finished_ok.emit(str(self._out), len(replacements))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
 
 
 # ---------- helpers ----------
